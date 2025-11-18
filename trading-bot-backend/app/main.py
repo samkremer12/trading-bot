@@ -553,6 +553,249 @@ def normalize_symbol(symbol: str, exchange_type: str) -> str:
     else:
         return f"{symbol}/USDT"
 
+async def execute_webhook_for_user(username: str, user_state: UserState, alert: WebhookAlert, timeout_seconds: int = 30) -> Dict[str, Any]:
+    """
+    Execute webhook for a single user with error handling and timeout.
+    Returns a dict with execution result for logging.
+    """
+    result = {
+        "username": username,
+        "timestamp": datetime.now().isoformat(),
+        "status": "pending",
+        "executed": False,
+        "error": None,
+        "order": None
+    }
+    
+    try:
+        if user_state.emergency_stop:
+            result["status"] = "skipped"
+            result["error"] = "Emergency stop activated"
+            return result
+        
+        if not user_state.auto_trading_enabled:
+            result["status"] = "skipped"
+            result["error"] = "Auto-trading disabled"
+            return result
+        
+        coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
+        if coin in user_state.coin_trading_enabled and not user_state.coin_trading_enabled[coin]:
+            result["status"] = "skipped"
+            result["error"] = f"{coin} trading is disabled"
+            return result
+        
+        if not user_state.exchange and not user_state.kraken_client:
+            result["status"] = "failed"
+            result["error"] = "Exchange not configured"
+            return result
+        
+        if not user_state.api_connected:
+            result["status"] = "failed"
+            result["error"] = "API not connected"
+            return result
+        
+        async def execute_trade():
+            symbol = normalize_symbol(alert.symbol, user_state.exchange_type)
+            action = alert.action.lower()
+            
+            if action in ["buy", "long"]:
+                side = "buy"
+            elif action in ["sell", "short", "close"]:
+                side = "sell"
+            else:
+                raise ValueError(f"Invalid action: {action}")
+            
+            amount = 0.001  # default
+            
+            if user_state.exchange_type == "kraken" and user_state.kraken_client:
+                balance_data = await user_state.kraken_client.get_balance()
+                usdt_balance = float(balance_data.get('USDT', 0))
+                
+                if alert.sell_all:
+                    coin_key = coin
+                    if coin == "BTC":
+                        coin_key = "XBT"
+                    coin_balance = float(balance_data.get(coin_key, 0))
+                    amount = round_kraken_volume(alert.symbol, coin_balance)
+                elif alert.usd_amount:
+                    if alert.price:
+                        raw_amount = alert.usd_amount / float(alert.price)
+                    else:
+                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        raw_amount = alert.usd_amount / current_price
+                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                    coin_key = coin
+                    if coin == "BTC":
+                        coin_key = "XBT"
+                    coin_balance = float(balance_data.get(coin_key, 0))
+                    amount = round_kraken_volume(alert.symbol, coin_balance)
+                elif alert.quantity_usd:
+                    if alert.price:
+                        raw_amount = alert.quantity_usd / float(alert.price)
+                    else:
+                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        raw_amount = alert.quantity_usd / current_price
+                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                elif alert.quantity:
+                    raw_amount = float(alert.quantity)
+                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                elif usdt_balance > 0:
+                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
+                    if alert.price:
+                        raw_amount = position_size_usdt / float(alert.price)
+                    else:
+                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        raw_amount = position_size_usdt / current_price
+                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                else:
+                    amount = round_kraken_volume(alert.symbol, 0.001)
+                
+                order = None
+                max_retries = 3
+                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                
+                for attempt in range(max_retries):
+                    try:
+                        if alert.price:
+                            price = float(alert.price)
+                            order_result = await user_state.kraken_client.add_order(
+                                pair=kraken_pair,
+                                side=side,
+                                order_type='limit',
+                                volume=amount,
+                                price=price
+                            )
+                            order = {
+                                'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
+                                'status': 'open',
+                                'average': price,
+                                'price': price
+                            }
+                        else:
+                            order_result = await user_state.kraken_client.add_order(
+                                pair=kraken_pair,
+                                side=side,
+                                order_type='market',
+                                volume=amount
+                            )
+                            order = {
+                                'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
+                                'status': 'open',
+                                'average': 0,
+                                'price': 0
+                            }
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise
+                        await asyncio.sleep(1)
+                
+                exchange_pair = kraken_pair
+            else:
+                balance = user_state.exchange.fetch_balance()
+                usdt_balance = balance.get('USDT', {}).get('free', 0)
+                
+                if alert.sell_all:
+                    coin_balance = balance.get(coin, {}).get('free', 0)
+                    amount = coin_balance
+                elif alert.usd_amount:
+                    if alert.price:
+                        amount = alert.usd_amount / float(alert.price)
+                    else:
+                        ticker = user_state.exchange.fetch_ticker(symbol)
+                        current_price = ticker['last']
+                        amount = alert.usd_amount / current_price
+                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                    coin_balance = balance.get(coin, {}).get('free', 0)
+                    amount = coin_balance
+                elif alert.quantity_usd:
+                    if alert.price:
+                        amount = alert.quantity_usd / float(alert.price)
+                    else:
+                        ticker = user_state.exchange.fetch_ticker(symbol)
+                        current_price = ticker['last']
+                        amount = alert.quantity_usd / current_price
+                elif alert.quantity:
+                    amount = float(alert.quantity)
+                elif usdt_balance > 0:
+                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
+                    if alert.price:
+                        amount = position_size_usdt / float(alert.price)
+                    else:
+                        ticker = user_state.exchange.fetch_ticker(symbol)
+                        current_price = ticker['last']
+                        amount = position_size_usdt / current_price
+                else:
+                    amount = 0.001
+                
+                order = None
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        if alert.price:
+                            price = float(alert.price)
+                            order = user_state.exchange.create_limit_order(symbol, side, amount, price)
+                        else:
+                            order = user_state.exchange.create_market_order(symbol, side, amount)
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise
+                        await asyncio.sleep(1)
+                
+                exchange_pair = symbol
+            
+            entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
+            
+            trade = {
+                "timestamp": datetime.now().isoformat(),
+                "symbol": symbol,
+                "coin": coin,
+                "side": side,
+                "amount": amount,
+                "entry_price": entry_price,
+                "order_id": order.get('id'),
+                "status": order.get('status'),
+                "stop_loss": alert.stop_loss,
+                "take_profit": alert.take_profit,
+                "pnl": 0.0,
+                "raw_symbol": alert.symbol,
+                "exchange_pair": exchange_pair
+            }
+            
+            user_state.last_order = trade
+            user_state.orders_history.append(trade)
+            
+            if side == "buy":
+                user_state.open_trades.append(trade)
+            else:
+                user_state.closed_trades.append(trade)
+            
+            return trade
+        
+        trade = await asyncio.wait_for(execute_trade(), timeout=timeout_seconds)
+        
+        result["status"] = "executed"
+        result["executed"] = True
+        result["order"] = trade
+        
+        logger.info(f"User {username}: Order executed successfully: {trade}")
+        
+    except asyncio.TimeoutError:
+        result["status"] = "failed"
+        result["error"] = "Execution timeout"
+        logger.error(f"User {username}: Webhook execution timeout")
+    except Exception as e:
+        result["status"] = "failed"
+        result["error"] = str(e)
+        logger.error(f"User {username}: Webhook execution failed: {str(e)}")
+    
+    return result
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
@@ -852,327 +1095,88 @@ async def emergency_stop(request: EmergencyStopRequest, username: str = Depends(
 
 @app.post("/webhook")
 async def webhook(alert: WebhookAlert):
-    webhook_log = {
-        "timestamp": datetime.now().isoformat(),
-        "payload": alert.dict(),
-        "status": "received",
-        "executed": False,
-        "error": None
-    }
-    
+    """
+    Broadcast webhook endpoint - executes trades for all eligible users.
+    Each user's execution is independent with individual error handling.
+    """
     logger.info(f"Webhook received: {alert.dict()}")
     
     try:
         if not verify_webhook_secret(alert.secret):
-            webhook_log["status"] = "rejected"
-            webhook_log["error"] = "Invalid webhook secret"
-            state.webhook_logs.append(webhook_log)
             logger.warning(f"Invalid webhook secret received")
             raise HTTPException(status_code=401, detail="Invalid webhook secret")
         
         if not check_rate_limit():
-            webhook_log["status"] = "rejected"
-            webhook_log["error"] = "Rate limit exceeded"
-            state.webhook_logs.append(webhook_log)
             logger.warning(f"Rate limit exceeded for webhook endpoint")
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 10 requests per minute.")
         
-        state.last_webhook = {
-            "timestamp": datetime.now().isoformat(),
-            "payload": alert.dict()
-        }
+        # Broadcast to all users
+        execution_results = []
+        eligible_users = []
         
-        if state.emergency_stop:
-            webhook_log["status"] = "rejected"
-            webhook_log["error"] = "Emergency stop activated"
-            state.webhook_logs.append(webhook_log)
-            logger.warning("Webhook rejected - Emergency stop is active")
-            return {
-                "success": False,
-                "message": "Emergency stop is active - all trading disabled",
-                "executed": False
-            }
+        for username, user in list(users.items()):
+            user_state = user.state
+            if user_state.api_connected:
+                eligible_users.append((username, user_state))
         
-        if not state.auto_trading_enabled:
-            webhook_log["status"] = "skipped"
-            webhook_log["error"] = "Auto-trading disabled"
-            state.webhook_logs.append(webhook_log)
-            logger.info("Webhook received but auto-trading is disabled")
+        if not eligible_users:
+            logger.info("No eligible users found for webhook execution")
             return {
                 "success": True,
-                "message": "Webhook received but auto-trading is disabled",
-                "executed": False
+                "message": "Webhook received but no eligible users",
+                "executed": False,
+                "results": []
             }
         
-        coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
-        if coin in state.coin_trading_enabled and not state.coin_trading_enabled[coin]:
-            webhook_log["status"] = "rejected"
-            webhook_log["error"] = f"{coin} trading is disabled"
-            state.webhook_logs.append(webhook_log)
-            logger.info(f"Webhook rejected - {coin} trading is disabled")
-            return {
-                "success": False,
-                "message": f"{coin} trading is disabled",
-                "executed": False
+        logger.info(f"Broadcasting webhook to {len(eligible_users)} eligible users")
+        
+        tasks = []
+        for username, user_state in eligible_users:
+            task = execute_webhook_for_user(username, user_state, alert)
+            tasks.append(task)
+        
+        execution_results = await asyncio.gather(*tasks, return_exceptions=False)
+        
+        for result in execution_results:
+            username = result.get("username")
+            user_state = users[username].state
+            
+            webhook_log = {
+                "timestamp": result.get("timestamp"),
+                "payload": alert.dict(),
+                "status": result.get("status"),
+                "executed": result.get("executed"),
+                "error": result.get("error"),
+                "order": result.get("order")
             }
-        
-        if not state.exchange and not state.kraken_client:
-            webhook_log["status"] = "rejected"
-            webhook_log["error"] = "Exchange not configured"
-            state.webhook_logs.append(webhook_log)
-            logger.error("Exchange not configured")
-            raise HTTPException(status_code=400, detail="Exchange not configured. Please set API credentials first.")
-        
-        symbol = normalize_symbol(alert.symbol, state.exchange_type)
-        action = alert.action.lower()
-        
-        if action in ["buy", "long"]:
-            side = "buy"
-        elif action in ["sell", "short", "close"]:
-            side = "sell"
-        else:
-            logger.error(f"Invalid action: {action}")
-            raise HTTPException(status_code=400, detail=f"Invalid action: {action}")
-        
-        if state.exchange_type == "kraken" and state.kraken_client:
-            try:
-                balance_data = await state.kraken_client.get_balance()
-                usdt_balance = float(balance_data.get('USDT', 0))
-                
-                if alert.sell_all:
-                    coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
-                    if coin == "BTC":
-                        coin = "XBT"  # Kraken uses XBT for Bitcoin
-                    coin_balance = float(balance_data.get(coin, 0))
-                    amount = round_kraken_volume(alert.symbol, coin_balance)
-                    logger.info(f"Selling all {coin}: {amount} (rounded from {coin_balance})")
-                
-                elif alert.usd_amount:
-                    if alert.price:
-                        raw_amount = alert.usd_amount / float(alert.price)
-                    else:
-                        kraken_pair = state.kraken_client.to_kraken_pair(alert.symbol)
-                        current_price = await state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = alert.usd_amount / current_price
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
-                    logger.info(f"Buying with ${alert.usd_amount}: {amount} coins (rounded from {raw_amount})")
-                
-                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                    coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
-                    if coin == "BTC":
-                        coin = "XBT"  # Kraken uses XBT for Bitcoin
-                    coin_balance = float(balance_data.get(coin, 0))
-                    amount = round_kraken_volume(alert.symbol, coin_balance)
-                    logger.info(f"Selling all {coin}: {amount} (rounded from {coin_balance})")
-                
-                elif alert.quantity_usd:
-                    if alert.price:
-                        raw_amount = alert.quantity_usd / float(alert.price)
-                    else:
-                        kraken_pair = state.kraken_client.to_kraken_pair(alert.symbol)
-                        current_price = await state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = alert.quantity_usd / current_price
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
-                    logger.info(f"Buying with ${alert.quantity_usd}: {amount} coins (rounded from {raw_amount})")
-                
-                elif alert.quantity:
-                    raw_amount = float(alert.quantity)
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
-                    logger.info(f"Using explicit quantity: {amount} (rounded from {raw_amount})")
-                
-                elif usdt_balance > 0:
-                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
-                    if alert.price:
-                        raw_amount = position_size_usdt / float(alert.price)
-                    else:
-                        kraken_pair = state.kraken_client.to_kraken_pair(alert.symbol)
-                        current_price = await state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = position_size_usdt / current_price
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
-                    logger.info(f"Using 2% position sizing: {amount} coins (rounded from {raw_amount})")
-                else:
-                    amount = round_kraken_volume(alert.symbol, 0.001)
-                    logger.info(f"Using minimum default: {amount}")
-                
-                logger.info(f"Final calculated position size for Kraken: {amount} for {symbol}")
-            except Exception as e:
-                logger.warning(f"Failed to calculate position size: {str(e)}, using default")
-                amount = round_kraken_volume(alert.symbol, 0.001)
+            user_state.webhook_logs.append(webhook_log)
             
-            order = None
-            max_retries = 3
-            kraken_pair = state.kraken_client.to_kraken_pair(alert.symbol)
-            
-            for attempt in range(max_retries):
-                try:
-                    if alert.price:
-                        price = float(alert.price)
-                        order_result = await state.kraken_client.add_order(
-                            pair=kraken_pair,
-                            side=side,
-                            order_type='limit',
-                            volume=amount,
-                            price=price
-                        )
-                        logger.info(f"Kraken limit order executed: {kraken_pair} {side} {amount} @ {price}")
-                        order = {
-                            'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
-                            'status': 'open',
-                            'average': price,
-                            'price': price
-                        }
-                    else:
-                        order_result = await state.kraken_client.add_order(
-                            pair=kraken_pair,
-                            side=side,
-                            order_type='market',
-                            volume=amount
-                        )
-                        logger.info(f"Kraken market order executed: {kraken_pair} {side} {amount}")
-                        order = {
-                            'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
-                            'status': 'open',
-                            'average': 0,
-                            'price': 0
-                        }
-                    break
-                except Exception as e:
-                    logger.error(f"Kraken order execution attempt {attempt + 1} failed: {str(e)}")
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
-        else:
-            try:
-                balance = state.exchange.fetch_balance()
-                usdt_balance = balance.get('USDT', {}).get('free', 0)
-                
-                if alert.sell_all:
-                    coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
-                    coin_balance = balance.get(coin, {}).get('free', 0)
-                    amount = coin_balance
-                    logger.info(f"Selling all {coin}: {amount}")
-                
-                elif alert.usd_amount:
-                    if alert.price:
-                        amount = alert.usd_amount / float(alert.price)
-                    else:
-                        ticker = state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = alert.usd_amount / current_price
-                    logger.info(f"Buying with ${alert.usd_amount}: {amount} coins")
-                
-                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                    coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
-                    coin_balance = balance.get(coin, {}).get('free', 0)
-                    amount = coin_balance
-                    logger.info(f"Selling all {coin}: {amount}")
-                
-                elif alert.quantity_usd:
-                    if alert.price:
-                        amount = alert.quantity_usd / float(alert.price)
-                    else:
-                        ticker = state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = alert.quantity_usd / current_price
-                    logger.info(f"Buying with ${alert.quantity_usd}: {amount} coins")
-                
-                elif alert.quantity:
-                    amount = float(alert.quantity)
-                
-                elif usdt_balance > 0:
-                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
-                    if alert.price:
-                        amount = position_size_usdt / float(alert.price)
-                    else:
-                        ticker = state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = position_size_usdt / current_price
-                else:
-                    amount = 0.001
-                
-                logger.info(f"Calculated position size: {amount} for {symbol}")
-            except Exception as e:
-                logger.warning(f"Failed to calculate position size: {str(e)}, using default")
-                amount = float(alert.quantity) if alert.quantity and alert.quantity != "all" else 0.001
-            
-            order = None
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    if alert.price:
-                        price = float(alert.price)
-                        order = state.exchange.create_limit_order(symbol, side, amount, price)
-                        logger.info(f"Limit order executed: {symbol} {side} {amount} @ {price}")
-                    else:
-                        order = state.exchange.create_market_order(symbol, side, amount)
-                        logger.info(f"Market order executed: {symbol} {side} {amount}")
-                    break
-                except Exception as e:
-                    logger.error(f"Order execution attempt {attempt + 1} failed: {str(e)}")
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
+            if result.get("executed"):
+                user_state.last_webhook = {
+                    "timestamp": datetime.now().isoformat(),
+                    "payload": alert.dict()
+                }
         
-        entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
+        save_users()
         
-        if state.exchange_type == "kraken" and state.kraken_client:
-            exchange_pair = kraken_pair
-        else:
-            exchange_pair = symbol
+        executed_count = sum(1 for r in execution_results if r.get("executed"))
+        skipped_count = sum(1 for r in execution_results if r.get("status") == "skipped")
+        failed_count = sum(1 for r in execution_results if r.get("status") == "failed")
         
-        trade = {
-            "timestamp": datetime.now().isoformat(),
-            "symbol": symbol,
-            "coin": coin,
-            "side": side,
-            "amount": amount,
-            "entry_price": entry_price,
-            "order_id": order.get('id'),
-            "status": order.get('status'),
-            "stop_loss": alert.stop_loss,
-            "take_profit": alert.take_profit,
-            "pnl": 0.0,
-            "raw_symbol": alert.symbol,
-            "exchange_pair": exchange_pair
-        }
-        
-        state.last_order = trade
-        state.orders_history.append(trade)
-        
-        if side == "buy":
-            state.open_trades.append(trade)
-            logger.info(f"Trade opened: {trade}")
-        else:
-            state.closed_trades.append(trade)
-            logger.info(f"Trade closed: {trade}")
-        
-        webhook_log["status"] = "executed"
-        webhook_log["executed"] = True
-        state.webhook_logs.append(webhook_log)
-        
-        logger.info(f"Order recorded: {trade}")
-        
-        if alert.stop_loss or alert.take_profit:
-            logger.info(f"Stop loss/take profit requested but not yet implemented")
+        logger.info(f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed")
         
         return {
             "success": True,
-            "message": "Order executed successfully",
-            "order": state.last_order
+            "message": f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed",
+            "executed": executed_count > 0,
+            "results": execution_results
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = f"Failed to execute order: {str(e)}"
+        error_msg = f"Webhook broadcast failed: {str(e)}"
         logger.error(error_msg)
-        webhook_log["status"] = "failed"
-        webhook_log["error"] = error_msg
-        state.webhook_logs.append(webhook_log)
-        state.last_order = {
-            "timestamp": datetime.now().isoformat(),
-            "error": error_msg
-        }
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.post("/place-order")
