@@ -44,6 +44,8 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "trading-bot-secret-key-change-in-prod
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 7
 webhook_request_times = []
+processed_idempotency_keys = {}
+IDEMPOTENCY_TTL_SECONDS = 3600
 
 def hash_password_bcrypt(password: str) -> str:
     """Hash password using bcrypt"""
@@ -92,7 +94,7 @@ def verify_session(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def check_rate_limit() -> bool:
-    """Rate limit: max 10 requests per minute"""
+    """Global rate limit: max 10 requests per minute"""
     current_time = time.time()
     webhook_request_times[:] = [t for t in webhook_request_times if current_time - t < 60]
     
@@ -101,6 +103,42 @@ def check_rate_limit() -> bool:
     
     webhook_request_times.append(current_time)
     return True
+
+def check_user_rate_limit(user_state: 'UserState', max_requests: int = 20, window_seconds: int = 60) -> bool:
+    """Per-user rate limit: max 20 requests per minute by default"""
+    current_time = time.time()
+    user_state.rate_limit_requests[:] = [t for t in user_state.rate_limit_requests if current_time - t < window_seconds]
+    
+    if len(user_state.rate_limit_requests) >= max_requests:
+        return False
+    
+    user_state.rate_limit_requests.append(current_time)
+    return True
+
+def log_event(user_state: 'UserState', action: str, status: str, details: Optional[Dict] = None, error: Optional[str] = None):
+    """Log critical events for auditing"""
+    event = {
+        "timestamp": datetime.now().isoformat(),
+        "action": action,
+        "status": status,
+        "details": details or {},
+        "error": error
+    }
+    user_state.event_logs.append(event)
+    
+    if len(user_state.event_logs) > 1000:
+        user_state.event_logs = user_state.event_logs[-1000:]
+    
+    log_msg = f"[{user_state.username}] {action} - {status}"
+    if error:
+        log_msg += f" - Error: {error}"
+    if details:
+        log_msg += f" - Details: {details}"
+    
+    if status == "failed" or error:
+        logger.error(log_msg)
+    else:
+        logger.info(log_msg)
 
 def calculate_position_size(balance: float, risk_percentage: float = 0.02) -> float:
     """Calculate position size based on account balance (default 2%)"""
@@ -283,6 +321,8 @@ class UserState:
         self.stop_loss_enabled: bool = True
         self.stop_loss_pct: float = 0.02
         self._stoploss_running: bool = False
+        self.rate_limit_requests: List[float] = []
+        self.event_logs: List[Dict] = []
 
 class User:
     """User account with credentials"""
@@ -479,6 +519,7 @@ class WebhookAlert(BaseModel):
     usd_amount: Optional[float] = None
     sell_all: Optional[bool] = None
     timestamp: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 class OrderRequest(BaseModel):
     symbol: str
@@ -863,10 +904,11 @@ async def user_login(request: UserLoginRequest):
     
     user = users[username]
     if not verify_password_bcrypt(password, user.password_hash):
+        log_event(user.state, "login", "failed", error="Invalid password")
         raise HTTPException(status_code=401, detail="Invalid username or password")
     
     token = create_jwt_token(username)
-    logger.info(f"User logged in: {username}")
+    log_event(user.state, "login", "success", details={"username": username})
     
     return {
         "success": True,
@@ -913,6 +955,7 @@ async def save_settings(request: ApiSettingsRequest, username: str = Depends(ver
                 user_state.api_connected = True
                 user_state.connection_error = None
                 
+                log_event(user_state, "settings_update", "success", details={"exchange": exchange, "api_connected": True})
                 save_users()
                 
                 return {
@@ -924,6 +967,7 @@ async def save_settings(request: ApiSettingsRequest, username: str = Depends(ver
                 
             except Exception as e:
                 error_msg = str(e)
+                log_event(user_state, "settings_update", "failed", details={"exchange": exchange}, error=error_msg)
                 logger.error(f"Kraken API connection failed for user {username}: {error_msg}")
                 
                 if "EAPI:Invalid key" in error_msg or "Invalid API key" in error_msg:
@@ -1110,7 +1154,23 @@ async def webhook(alert: WebhookAlert):
             logger.warning(f"Rate limit exceeded for webhook endpoint")
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 10 requests per minute.")
         
-        # Broadcast to all users
+        if alert.idempotency_key:
+            current_time = datetime.now().timestamp()
+            
+            if alert.idempotency_key in processed_idempotency_keys:
+                cached_result = processed_idempotency_keys[alert.idempotency_key]
+                if current_time - cached_result['timestamp'] < IDEMPOTENCY_TTL_SECONDS:
+                    logger.info(f"Duplicate webhook detected with idempotency_key: {alert.idempotency_key}")
+                    return {
+                        "success": True,
+                        "message": "Duplicate request - returning cached result",
+                        "executed": False,
+                        "duplicate": True,
+                        "cached_result": cached_result['result']
+                    }
+                else:
+                    del processed_idempotency_keys[alert.idempotency_key]
+        
         execution_results = []
         eligible_users = []
         
@@ -1165,12 +1225,21 @@ async def webhook(alert: WebhookAlert):
         
         logger.info(f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed")
         
-        return {
+        result = {
             "success": True,
             "message": f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed",
             "executed": executed_count > 0,
             "results": execution_results
         }
+        
+        if alert.idempotency_key:
+            processed_idempotency_keys[alert.idempotency_key] = {
+                'timestamp': datetime.now().timestamp(),
+                'result': result
+            }
+            logger.info(f"Cached result for idempotency_key: {alert.idempotency_key}")
+        
+        return result
         
     except HTTPException:
         raise
