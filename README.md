@@ -12,11 +12,16 @@ A complete plug-and-play automated trading application that executes trades base
 
 - **Multi-Exchange Support**: Binance, KuCoin, Kraken, Bybit, Coinbase Advanced
 - **Secure API Key Storage**: AES-256 encryption for API credentials
+- **Password Protection**: Dashboard protected with authentication
+- **Webhook Secret Verification**: All webhook requests require secret token
+- **Rate Limiting**: Max 10 webhook requests per minute
 - **Auto-Generated Webhook URL**: Automatically generated based on deployment domain
 - **Real-Time Dashboard**: Live status updates every 3 seconds
-- **Order Execution**: Market/limit orders with stop-loss and take-profit support
+- **Order Execution**: Market/limit orders with automatic retry logic
+- **Position Sizing**: Automatic position sizing at 2% of account balance
+- **Comprehensive Logging**: All trades and webhooks logged for monitoring
 - **PnL Tracking**: Track total orders and profit/loss
-- **TradingView Integration**: Simple JSON webhook format
+- **TradingView Integration**: Secure JSON webhook format
 - **Auto-Trading Toggle**: Enable/disable automated trading with one click
 
 ## Supported Symbols
@@ -31,6 +36,9 @@ A complete plug-and-play automated trading application that executes trades base
 ### 1. Access the Dashboard
 
 Navigate to: https://trading-auto-app-byis2mp8.devinapps.com
+
+**Login Credentials:**
+- Password: `Samkremer12!!`
 
 ### 2. Configure Your Exchange API
 
@@ -56,6 +64,7 @@ The app will verify your credentials and connect to your exchange.
 
 ```json
 {
+  "secret": "Samkremer12",
   "action": "buy",
   "symbol": "BTCUSDT",
   "price": "{{close}}",
@@ -64,10 +73,11 @@ The app will verify your credentials and connect to your exchange.
 ```
 
 **Alert JSON Parameters:**
+- `secret`: "Samkremer12" (required for security)
 - `action`: "buy", "sell", "long", "short", or "close"
 - `symbol`: "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"
 - `price`: Use TradingView variables like `{{close}}` or specify a price
-- `quantity`: Amount to trade (optional, defaults to 0.001)
+- `quantity`: Amount to trade (optional, auto-calculated at 2% of balance)
 
 ### 5. Enable Auto-Trading
 
@@ -203,14 +213,49 @@ npm run build
 deploy frontend --dir=/path/to/trading-bot-frontend/dist
 ```
 
-## Security Notes
+## Security Features
 
-- API keys are encrypted using AES-256 before storage
-- Keys are stored in-memory only (lost on restart)
-- For production use, consider using a persistent encrypted database
+### 1. Password Protection
+- Dashboard is password-protected with authentication
+- Login required before accessing any trading features
+- Session-based authentication with secure tokens
+
+### 2. Webhook Security
+- **Secret Token Verification**: All webhook requests must include the secret token "Samkremer12"
+- **Rate Limiting**: Maximum 10 webhook requests per minute to prevent abuse
+- **Request Validation**: All webhook payloads are validated before execution
+- **HTTPS Only**: All traffic uses HTTPS encryption
+
+### 3. API Key Security
+- **AES-256 Encryption**: API keys encrypted before storage
+- **Backend-Only Storage**: Keys never sent to frontend after initial setup
+- **In-Memory Storage**: Keys stored in-memory only (lost on restart)
+- **Recommended Permissions**: Query orders/trades, create/modify/cancel orders only
+- **Disable**: Withdrawals, deposits, and earn features on exchange
+
+### 4. Trading Safety
+- **Position Sizing**: Automatic position sizing at 2% of account balance
+- **Retry Logic**: Failed trades automatically retried up to 3 times
+- **Comprehensive Logging**: All webhook requests and trades logged
+- **Auto-Trading Toggle**: Easy on/off switch for emergency stops
+
+### 5. Kraken API Recommended Permissions
+When creating your Kraken API key, enable only:
+- ✓ Query open orders & trades
+- ✓ Query closed orders & trades
+- ✓ Create & modify orders
+- ✓ Cancel/close orders
+- ✗ Withdraw funds (DISABLE)
+- ✗ Deposit funds (DISABLE)
+- ✗ Earn (DISABLE)
+
+### Security Best Practices
 - Never commit API keys or secrets to the repository
-- Use read-only API keys when possible
+- Use read-only API keys when possible for monitoring
 - Enable IP whitelisting on your exchange if supported
+- Monitor the dashboard regularly for unexpected activity
+- Start with small position sizes to test the bot
+- Keep your webhook secret token private
 
 ## Important Warnings
 
