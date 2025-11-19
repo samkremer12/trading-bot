@@ -1,0 +1,6 @@
+app = "app-zebaeret"
+primary_region = "sjc"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
