@@ -20,6 +20,7 @@ import asyncio
 import jwt
 import bcrypt
 import uuid
+from app.database import init_db, get_db, save_user_to_db, load_all_users_from_db, SessionLocal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -353,95 +354,126 @@ USERS_FILE = os.path.join(PERSISTENCE_DIR, "users.json")
 LEGACY_STATE_FILE = os.path.join(PERSISTENCE_DIR, "state.json")
 
 def save_users():
-    """Save all users to persistent storage"""
+    """Save all users to persistent SQLite database"""
     try:
-        os.makedirs(PERSISTENCE_DIR, exist_ok=True)
-        
-        users_data = {}
-        for username, user in users.items():
-            user_state = user.state
-            users_data[username] = {
-                "password_hash": user.password_hash,
-                "created_at": user.created_at,
-                "exchange_type": user_state.exchange_type,
-                "api_key": cipher.encrypt(user_state.api_key.encode()).decode() if user_state.api_key else None,
-                "api_secret": cipher.encrypt(user_state.api_secret.encode()).decode() if user_state.api_secret else None,
-                "auto_trading_enabled": user_state.auto_trading_enabled,
-                "coin_trading_enabled": user_state.coin_trading_enabled,
-                "emergency_stop": user_state.emergency_stop,
-                "stop_loss_enabled": user_state.stop_loss_enabled,
-                "stop_loss_pct": user_state.stop_loss_pct
-            }
-        
-        temp_file = USERS_FILE + ".tmp"
-        with open(temp_file, 'w') as f:
-            json.dump(users_data, f, indent=2)
-        os.replace(temp_file, USERS_FILE)
-        
-        logger.info(f"Users saved to persistent storage at {USERS_FILE}")
-        return True
+        db = SessionLocal()
+        try:
+            for username, user in users.items():
+                user_state = user.state
+                user_data = {
+                    "password_hash": user.password_hash,
+                    "created_at": user.created_at,
+                    "exchange_type": user_state.exchange_type,
+                    "api_key": cipher.encrypt(user_state.api_key.encode()).decode() if user_state.api_key else None,
+                    "api_secret": cipher.encrypt(user_state.api_secret.encode()).decode() if user_state.api_secret else None,
+                    "api_connected": user_state.api_connected,
+                    "connection_error": user_state.connection_error,
+                    "auto_trading_enabled": user_state.auto_trading_enabled,
+                    "coin_trading_enabled": user_state.coin_trading_enabled,
+                    "emergency_stop": user_state.emergency_stop,
+                    "stop_loss_enabled": user_state.stop_loss_enabled,
+                    "stop_loss_pct": user_state.stop_loss_pct,
+                    "last_webhook": user_state.last_webhook,
+                    "last_order": user_state.last_order,
+                    "orders_history": user_state.orders_history,
+                    "open_trades": user_state.open_trades,
+                    "closed_trades": user_state.closed_trades,
+                    "webhook_logs": user_state.webhook_logs,
+                    "event_logs": user_state.event_logs,
+                    "total_pnl": user_state.total_pnl,
+                    "per_coin_pnl": user_state.per_coin_pnl
+                }
+                save_user_to_db(db, username, user_data)
+            
+            logger.info(f"Users saved to SQLite database")
+            return True
+        finally:
+            db.close()
     except Exception as e:
-        logger.error(f"Failed to save users to {USERS_FILE}: {str(e)}")
+        logger.error(f"Failed to save users to database: {str(e)}")
         return False
 
 async def load_users_and_connect():
-    """Load all users from persistent storage and reconnect"""
-    logger.info(f"load_users_and_connect starting; USERS_FILE={USERS_FILE}")
+    """Load all users from SQLite database and reconnect"""
+    logger.info(f"load_users_and_connect starting; loading from SQLite database")
     try:
-        if not os.path.exists(USERS_FILE):
-            logger.info(f"No users file found at {USERS_FILE}")
-            await migrate_legacy_state()
-            return
-        
-        logger.info(f"Loading users from {USERS_FILE}")
-        with open(USERS_FILE, 'r') as f:
-            users_data = json.load(f)
-        
-        for username, data in users_data.items():
-            user = User(username, data["password_hash"])
-            user.created_at = data.get("created_at", datetime.utcnow().isoformat())
-            user_state = user.state
+        db = SessionLocal()
+        try:
+            users_data = load_all_users_from_db(db)
             
-            user_state.exchange_type = data.get("exchange_type")
-            user_state.auto_trading_enabled = data.get("auto_trading_enabled", False)
-            user_state.coin_trading_enabled = data.get("coin_trading_enabled", {
-                "BTC": True, "ETH": True, "SOL": True, "XRP": True
-            })
-            user_state.emergency_stop = data.get("emergency_stop", False)
-            user_state.stop_loss_enabled = data.get("stop_loss_enabled", True)
-            user_state.stop_loss_pct = data.get("stop_loss_pct", 0.02)
+            if not users_data:
+                logger.info("No users found in database, checking for legacy data")
+                if os.path.exists(USERS_FILE):
+                    logger.info(f"Found legacy users file at {USERS_FILE}, migrating to database")
+                    with open(USERS_FILE, 'r') as f:
+                        legacy_users = json.load(f)
+                    for username, data in legacy_users.items():
+                        save_user_to_db(db, username, data)
+                    users_data = load_all_users_from_db(db)
+                    logger.info(f"Migrated {len(users_data)} users from JSON to SQLite")
+                else:
+                    await migrate_legacy_state()
+                    return
             
-            encrypted_key = data.get("api_key")
-            encrypted_secret = data.get("api_secret")
-            
-            if encrypted_key and encrypted_secret:
-                try:
-                    user_state.api_key = cipher.decrypt(encrypted_key.encode()).decode()
-                    user_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
-                    
-                    if user_state.exchange_type == "kraken":
-                        user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
-                        balance_data = await user_state.kraken_client.get_balance()
-                        user_state.api_connected = True
-                        user_state.connection_error = None
-                        logger.info(f"Reconnected user {username} to Kraken API successfully")
-                    else:
-                        user_state.exchange = get_exchange_instance(user_state.exchange_type, user_state.api_key, user_state.api_secret)
-                        balance = user_state.exchange.fetch_balance()
-                        user_state.api_connected = True
-                        user_state.connection_error = None
-                        logger.info(f"Reconnected user {username} to {user_state.exchange_type} successfully")
-                except Exception as e:
-                    user_state.api_connected = False
-                    user_state.connection_error = str(e)
-                    logger.error(f"Failed to reconnect user {username}: {str(e)}")
-            
-            users[username] = user
-        
-        logger.info(f"Loaded {len(users)} users from persistent storage")
+            for username, data in users_data.items():
+                user = User(username, data["password_hash"])
+                user.created_at = data.get("created_at", datetime.utcnow().isoformat())
+                user_state = user.state
                 
+                user_state.exchange_type = data.get("exchange_type")
+                user_state.api_connected = data.get("api_connected", False)
+                user_state.connection_error = data.get("connection_error")
+                user_state.auto_trading_enabled = data.get("auto_trading_enabled", False)
+                user_state.coin_trading_enabled = data.get("coin_trading_enabled", {
+                    "BTC": True, "ETH": True, "SOL": True, "XRP": True
+                })
+                user_state.emergency_stop = data.get("emergency_stop", False)
+                user_state.stop_loss_enabled = data.get("stop_loss_enabled", True)
+                user_state.stop_loss_pct = data.get("stop_loss_pct", 0.02)
+                
+                user_state.last_webhook = data.get("last_webhook")
+                user_state.last_order = data.get("last_order")
+                user_state.orders_history = data.get("orders_history", [])
+                user_state.open_trades = data.get("open_trades", [])
+                user_state.closed_trades = data.get("closed_trades", [])
+                user_state.webhook_logs = data.get("webhook_logs", [])
+                user_state.event_logs = data.get("event_logs", [])
+                user_state.total_pnl = data.get("total_pnl", 0.0)
+                user_state.per_coin_pnl = data.get("per_coin_pnl", {})
+                
+                encrypted_key = data.get("api_key")
+                encrypted_secret = data.get("api_secret")
+                
+                if encrypted_key and encrypted_secret:
+                    try:
+                        user_state.api_key = cipher.decrypt(encrypted_key.encode()).decode()
+                        user_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
+                        
+                        if user_state.exchange_type == "kraken":
+                            user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                            balance_data = await user_state.kraken_client.get_balance()
+                            user_state.api_connected = True
+                            user_state.connection_error = None
+                            logger.info(f"Reconnected user {username} to Kraken API successfully")
+                        else:
+                            user_state.exchange = get_exchange_instance(user_state.exchange_type, user_state.api_key, user_state.api_secret)
+                            balance = user_state.exchange.fetch_balance()
+                            user_state.api_connected = True
+                            user_state.connection_error = None
+                            logger.info(f"Reconnected user {username} to {user_state.exchange_type} successfully")
+                    except Exception as e:
+                        user_state.api_connected = False
+                        user_state.connection_error = str(e)
+                        logger.error(f"Failed to reconnect user {username}: {str(e)}")
+                
+                users[username] = user
+            
+            logger.info(f"Loaded {len(users)} users from SQLite database")
+        finally:
+            db.close()
+                    
     except Exception as e:
-        logger.error(f"Failed to load users: {str(e)}")
+        logger.error(f"Failed to load users from database: {str(e)}")
 
 async def migrate_legacy_state():
     """Migrate legacy single-user state to multi-user format"""
@@ -1590,7 +1622,9 @@ async def monitor_stop_loss():
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on app startup"""
-    logger.info("startup_event begin - loading users and starting multi-user monitoring")
+    logger.info("startup_event begin - initializing database and loading users")
+    init_db()
+    logger.info("Database initialized successfully")
     await load_users_and_connect()
     asyncio.create_task(monitor_stop_loss())
     logger.info(f"Background tasks started - monitoring {len(users)} users")
