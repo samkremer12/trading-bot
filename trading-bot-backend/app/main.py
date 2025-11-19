@@ -20,7 +20,10 @@ import asyncio
 import jwt
 import bcrypt
 import uuid
+from dotenv import load_dotenv
 from app.database import init_db, get_db, save_user_to_db, load_all_users_from_db, SessionLocal
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
