@@ -10,7 +10,11 @@ from sqlalchemy.orm import sessionmaker, Session
 
 logger = logging.getLogger(__name__)
 
-if os.path.isdir("/data"):
+if os.environ.get("DATABASE_URL"):
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    logger.info("Using managed Postgres database for persistent storage")
+    engine = create_engine(DATABASE_URL)
+elif os.path.isdir("/data"):
     DB_PATH = "/data/trading_bot.db"
     TEMP_DB_PATH = "/tmp/trading_bot.db"
     
@@ -23,16 +27,19 @@ if os.path.isdir("/data"):
             logger.error(f"Failed to migrate database: {e}")
     
     logger.info(f"Using persistent storage: {DB_PATH}")
+    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 elif os.environ.get("PERSISTENCE_DIR"):
     DB_PATH = os.path.join(os.environ.get("PERSISTENCE_DIR"), "trading_bot.db")
     logger.info(f"Using custom persistent storage: {DB_PATH}")
+    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 else:
     DB_PATH = "/tmp/trading_bot.db"
     logger.warning(f"Using ephemeral storage: {DB_PATH} (data will not survive full restarts)")
+    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
-DATABASE_URL = f"sqlite:///{DB_PATH}"
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
