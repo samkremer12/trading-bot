@@ -153,27 +153,68 @@ def verify_webhook_secret(secret: str) -> bool:
     """Verify webhook secret token"""
     return secret == WEBHOOK_SECRET
 
-def round_kraken_volume(symbol: str, volume: float) -> float:
-    """Round volume UP to Kraken's minimum step for the symbol (ceiling rounding)"""
-    symbol = symbol.upper().replace("USDT", "").replace("USD", "")
+async def round_and_enforce_kraken_volume(kraken_client, pair: str, symbol: str, raw_volume: float, side: str) -> float:
+    """
+    Round volume and enforce Kraken's ordermin for the pair.
+    Fetches lot_decimals and ordermin from Kraken AssetPairs API.
     
-    volume_steps = {
-        "BTC": 0.00001,   # 5 decimals
-        "XBT": 0.00001,   # 5 decimals (Kraken's BTC symbol)
-        "ETH": 0.00001,   # 5 decimals (more precise than before)
-        "SOL": 0.001,     # 3 decimals
-        "XRP": 0.1        # 1 decimal
-    }
-    
-    step = volume_steps.get(symbol, 0.00001)  # Default to 5 decimals for safety
-    
-    rounded = math.ceil(volume / step) * step
-    
-    final_volume = max(rounded, step)
-    
-    logger.info(f"Kraken volume rounding: symbol={symbol}, raw={volume:.8f}, step={step}, rounded={final_volume:.8f}")
-    
-    return final_volume
+    For sells: If balance < ordermin, returns 0 to skip the order (prevents "Insufficient funds")
+    For buys: Bumps volume to ordermin if needed
+    """
+    try:
+        pair_info = await kraken_client.get_asset_pairs(pair)
+        lot_decimals = pair_info['lot_decimals']
+        ordermin = pair_info['ordermin']
+        
+        step = 10 ** (-lot_decimals)
+        
+        if side == "buy":
+            rounded = math.ceil(raw_volume / step) * step
+            final_volume = max(rounded, ordermin)
+        else:
+            rounded = math.floor(raw_volume / step) * step
+            if rounded < ordermin:
+                logger.warning(f"Sell volume {rounded:.8f} below ordermin {ordermin:.8f} for {pair}. Skipping order to avoid insufficient funds.")
+                return 0.0
+            final_volume = rounded
+        
+        logger.info(f"Kraken volume: pair={pair}, side={side}, raw={raw_volume:.8f}, lot_decimals={lot_decimals}, step={step}, rounded={rounded:.8f}, ordermin={ordermin:.8f}, FINAL={final_volume:.8f}")
+        
+        return final_volume
+        
+    except Exception as e:
+        logger.error(f"Error fetching AssetPairs for {pair}: {e}. Using fallback rounding.")
+        symbol_clean = symbol.upper().replace("USDT", "").replace("USD", "")
+        fallback_steps = {
+            "BTC": 0.00001,
+            "XBT": 0.00001,
+            "ETH": 0.00001,
+            "SOL": 0.001,
+            "XRP": 0.1
+        }
+        fallback_ordermin = {
+            "BTC": 0.0001,
+            "XBT": 0.0001,
+            "ETH": 0.005,
+            "SOL": 0.1,
+            "XRP": 10.0
+        }
+        step = fallback_steps.get(symbol_clean, 0.00001)
+        ordermin = fallback_ordermin.get(symbol_clean, 0.001)
+        
+        if side == "buy":
+            rounded = math.ceil(raw_volume / step) * step
+            final_volume = max(rounded, ordermin)
+        else:
+            rounded = math.floor(raw_volume / step) * step
+            if rounded < ordermin:
+                logger.warning(f"Fallback: Sell volume {rounded:.8f} below ordermin {ordermin:.8f}. Skipping order.")
+                return 0.0
+            final_volume = rounded
+        
+        logger.info(f"Fallback rounding: symbol={symbol_clean}, raw={raw_volume:.8f}, step={step}, ordermin={ordermin}, final={final_volume:.8f}")
+        
+        return final_volume
 
 class KrakenClient:
     """Direct Kraken API client with proper HMAC-SHA512 authentication"""
@@ -293,6 +334,44 @@ class KrakenClient:
             last_price = float(price_data['c'][0])
             
             return last_price
+    
+    async def get_asset_pairs(self, pair: str) -> Dict[str, Any]:
+        """Get asset pair metadata from Kraken (lot_decimals, ordermin, etc)"""
+        url = f"{self.base_url}/0/public/AssetPairs"
+        params = {'pair': pair}
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
+            result = response.json()
+            
+            if result.get('error') and len(result['error']) > 0:
+                error_msg = ', '.join(result['error'])
+                raise Exception(f"Kraken AssetPairs error: {error_msg}")
+            
+            pairs_data = result.get('result', {})
+            if not pairs_data:
+                raise Exception(f"No AssetPairs data for {pair}")
+            
+            pair_key = list(pairs_data.keys())[0]
+            pair_info = pairs_data[pair_key]
+            
+            return {
+                'lot_decimals': pair_info.get('lot_decimals', 8),
+                'ordermin': float(pair_info.get('ordermin', '0.0001')),
+                'costmin': float(pair_info.get('costmin', '0')) if 'costmin' in pair_info else None
+            }
+    
+    def to_kraken_balance_key(self, coin: str) -> str:
+        """Convert coin symbol to Kraken balance key format"""
+        balance_key_map = {
+            "BTC": "XXBT",
+            "ETH": "XETH",
+            "SOL": "SOL",
+            "XRP": "XXRP",
+            "USDT": "USDT",
+            "USD": "ZUSD"
+        }
+        return balance_key_map.get(coin.upper(), coin.upper())
 
 class ExchangeType(str, Enum):
     BINANCE = "binance"
@@ -692,55 +771,59 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
                 balance_data = await user_state.kraken_client.get_balance()
                 usdt_balance = float(balance_data.get('USDT', 0))
+                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                
+                logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
                 if alert.sell_all:
-                    coin_key = coin
-                    if coin == "BTC":
-                        coin_key = "XBT"
+                    coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
                     coin_balance = float(balance_data.get(coin_key, 0))
-                    amount = round_kraken_volume(alert.symbol, coin_balance)
+                    logger.info(f"Sell all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
                 elif alert.usd_amount:
                     if alert.price:
                         price_used = float(alert.price)
                         raw_amount = alert.usd_amount / price_used
                         logger.info(f"USD conversion: ${alert.usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
                     else:
-                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                         current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
                         raw_amount = alert.usd_amount / current_price
                         logger.info(f"USD conversion: ${alert.usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                    coin_key = coin
-                    if coin == "BTC":
-                        coin_key = "XBT"
+                    coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
                     coin_balance = float(balance_data.get(coin_key, 0))
-                    amount = round_kraken_volume(alert.symbol, coin_balance)
+                    logger.info(f"Quantity all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
                 elif alert.quantity_usd:
                     if alert.price:
                         price_used = float(alert.price)
                         raw_amount = alert.quantity_usd / price_used
                         logger.info(f"USD conversion: ${alert.quantity_usd} / ${price_used} = {raw_amount:.8f} {coin}")
                     else:
-                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                         current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
                         raw_amount = alert.quantity_usd / current_price
                         logger.info(f"USD conversion: ${alert.quantity_usd} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity:
                     raw_amount = float(alert.quantity)
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif usdt_balance > 0:
                     position_size_usdt = calculate_position_size(usdt_balance, 0.02)
                     if alert.price:
                         raw_amount = position_size_usdt / float(alert.price)
                     else:
-                        kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                         current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
                         raw_amount = position_size_usdt / current_price
-                    amount = round_kraken_volume(alert.symbol, raw_amount)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 else:
-                    amount = round_kraken_volume(alert.symbol, 0.001)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, 0.001, side)
+                
+                if amount == 0:
+                    logger.warning(f"Skipping order: volume is 0 (likely dust balance below ordermin)")
+                    result["status"] = "skipped"
+                    result["error"] = "Volume below minimum order size"
+                    return result
                 
                 order = None
                 max_retries = 3
