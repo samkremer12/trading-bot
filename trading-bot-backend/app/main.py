@@ -20,6 +20,7 @@ import asyncio
 import jwt
 import bcrypt
 import uuid
+import math
 from dotenv import load_dotenv
 from app.database import init_db, get_db, save_user_to_db, load_all_users_from_db, SessionLocal
 
@@ -153,21 +154,26 @@ def verify_webhook_secret(secret: str) -> bool:
     return secret == WEBHOOK_SECRET
 
 def round_kraken_volume(symbol: str, volume: float) -> float:
-    """Round volume to Kraken's minimum step for the symbol"""
+    """Round volume UP to Kraken's minimum step for the symbol (ceiling rounding)"""
     symbol = symbol.upper().replace("USDT", "").replace("USD", "")
     
     volume_steps = {
-        "BTC": 0.00001,
-        "ETH": 0.0001,
-        "SOL": 0.01,
-        "XRP": 0.1
+        "BTC": 0.00001,   # 5 decimals
+        "XBT": 0.00001,   # 5 decimals (Kraken's BTC symbol)
+        "ETH": 0.00001,   # 5 decimals (more precise than before)
+        "SOL": 0.001,     # 3 decimals
+        "XRP": 0.1        # 1 decimal
     }
     
-    step = volume_steps.get(symbol, 0.0001)
+    step = volume_steps.get(symbol, 0.00001)  # Default to 5 decimals for safety
     
-    rounded = round(volume / step) * step
+    rounded = math.ceil(volume / step) * step
     
-    return max(rounded, step)
+    final_volume = max(rounded, step)
+    
+    logger.info(f"Kraken volume rounding: symbol={symbol}, raw={volume:.8f}, step={step}, rounded={final_volume:.8f}")
+    
+    return final_volume
 
 class KrakenClient:
     """Direct Kraken API client with proper HMAC-SHA512 authentication"""
@@ -695,11 +701,14 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     amount = round_kraken_volume(alert.symbol, coin_balance)
                 elif alert.usd_amount:
                     if alert.price:
-                        raw_amount = alert.usd_amount / float(alert.price)
+                        price_used = float(alert.price)
+                        raw_amount = alert.usd_amount / price_used
+                        logger.info(f"USD conversion: ${alert.usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
                     else:
                         kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                         current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
                         raw_amount = alert.usd_amount / current_price
+                        logger.info(f"USD conversion: ${alert.usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
                     amount = round_kraken_volume(alert.symbol, raw_amount)
                 elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
                     coin_key = coin
@@ -709,11 +718,14 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     amount = round_kraken_volume(alert.symbol, coin_balance)
                 elif alert.quantity_usd:
                     if alert.price:
-                        raw_amount = alert.quantity_usd / float(alert.price)
+                        price_used = float(alert.price)
+                        raw_amount = alert.quantity_usd / price_used
+                        logger.info(f"USD conversion: ${alert.quantity_usd} / ${price_used} = {raw_amount:.8f} {coin}")
                     else:
                         kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                         current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
                         raw_amount = alert.quantity_usd / current_price
+                        logger.info(f"USD conversion: ${alert.quantity_usd} / ${current_price} (live) = {raw_amount:.8f} {coin}")
                     amount = round_kraken_volume(alert.symbol, raw_amount)
                 elif alert.quantity:
                     raw_amount = float(alert.quantity)
