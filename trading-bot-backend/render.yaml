@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: trading-bot-backend
+    env: python
+    region: ohio
+    plan: free
+    buildCommand: "pip install poetry && poetry install"
+    startCommand: "poetry run fastapi run app/main.py --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: PORT
+        value: 8000
