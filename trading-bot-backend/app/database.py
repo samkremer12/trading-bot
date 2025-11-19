@@ -1,17 +1,34 @@
 import os
 import json
+import shutil
+import logging
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from sqlalchemy import create_engine, Column, String, Boolean, Float, Text, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+logger = logging.getLogger(__name__)
+
 if os.path.isdir("/data"):
     DB_PATH = "/data/trading_bot.db"
+    TEMP_DB_PATH = "/tmp/trading_bot.db"
+    
+    if not os.path.exists(DB_PATH) and os.path.exists(TEMP_DB_PATH):
+        logger.info(f"Migrating existing database from {TEMP_DB_PATH} to {DB_PATH}")
+        try:
+            shutil.copy2(TEMP_DB_PATH, DB_PATH)
+            logger.info(f"Successfully migrated database to {DB_PATH}")
+        except Exception as e:
+            logger.error(f"Failed to migrate database: {e}")
+    
+    logger.info(f"Using persistent storage: {DB_PATH}")
 elif os.environ.get("PERSISTENCE_DIR"):
     DB_PATH = os.path.join(os.environ.get("PERSISTENCE_DIR"), "trading_bot.db")
+    logger.info(f"Using custom persistent storage: {DB_PATH}")
 else:
     DB_PATH = "/tmp/trading_bot.db"
+    logger.warning(f"Using ephemeral storage: {DB_PATH} (data will not survive full restarts)")
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
