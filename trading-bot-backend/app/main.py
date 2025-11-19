@@ -153,6 +153,49 @@ def verify_webhook_secret(secret: str) -> bool:
     """Verify webhook secret token"""
     return secret == WEBHOOK_SECRET
 
+async def calculate_fee_aware_buy_volume(kraken_client, pair: str, usd_amount: float, price: float, balance_data: Dict) -> float:
+    """
+    Calculate maximum affordable buy volume accounting for Kraken fees.
+    Returns 0 if the order cannot be placed due to insufficient funds or below ordermin.
+    """
+    try:
+        pair_info = await kraken_client.get_asset_pairs(pair)
+        lot_decimals = pair_info['lot_decimals']
+        ordermin = pair_info['ordermin']
+        quote = pair_info['quote']
+        
+        fee_rate = await kraken_client.get_fee_rate(pair)
+        
+        quote_balance = float(balance_data.get(quote, 0))
+        
+        spend_cap = min(usd_amount, quote_balance / (1 + fee_rate))
+        
+        raw_vol = spend_cap / price
+        
+        step = 10 ** (-lot_decimals)
+        vol = math.floor(raw_vol / step) * step
+        
+        if vol < ordermin:
+            ordermin_cost_with_fees = ordermin * price * (1 + fee_rate)
+            if ordermin_cost_with_fees <= min(usd_amount, quote_balance):
+                vol = ordermin
+                logger.info(f"Volume below ordermin, bumping to {ordermin:.8f} (affordable with fees)")
+            else:
+                logger.warning(f"Cannot afford ordermin {ordermin:.8f} with fees. Required: ${ordermin_cost_with_fees:.2f}, Available: ${quote_balance:.2f}")
+                return 0.0
+        
+        estimated_cost = vol * price
+        est_fees = estimated_cost * fee_rate
+        est_total_cost = estimated_cost + est_fees
+        
+        logger.info(f"Fee-aware buy calculation: quote={quote}, quote_balance=${quote_balance:.2f}, usd_requested=${usd_amount:.2f}, price=${price:.2f}, fee_rate={fee_rate*100:.3f}%, spend_cap=${spend_cap:.2f}, raw_vol={raw_vol:.8f}, step={step}, vol={vol:.8f}, est_cost=${estimated_cost:.2f}, est_fees=${est_fees:.2f}, est_total=${est_total_cost:.2f}")
+        
+        return vol
+        
+    except Exception as e:
+        logger.error(f"Error in fee-aware buy calculation: {e}. Using fallback.")
+        return 0.0
+
 async def round_and_enforce_kraken_volume(kraken_client, pair: str, symbol: str, raw_volume: float, side: str) -> float:
     """
     Round volume and enforce Kraken's ordermin for the pair.
@@ -336,7 +379,7 @@ class KrakenClient:
             return last_price
     
     async def get_asset_pairs(self, pair: str) -> Dict[str, Any]:
-        """Get asset pair metadata from Kraken (lot_decimals, ordermin, etc)"""
+        """Get asset pair metadata from Kraken (lot_decimals, ordermin, base, quote, etc)"""
         url = f"{self.base_url}/0/public/AssetPairs"
         params = {'pair': pair}
         
@@ -358,8 +401,34 @@ class KrakenClient:
             return {
                 'lot_decimals': pair_info.get('lot_decimals', 8),
                 'ordermin': float(pair_info.get('ordermin', '0.0001')),
-                'costmin': float(pair_info.get('costmin', '0')) if 'costmin' in pair_info else None
+                'costmin': float(pair_info.get('costmin', '0')) if 'costmin' in pair_info else None,
+                'base': pair_info.get('base', ''),
+                'quote': pair_info.get('quote', '')
             }
+    
+    async def get_fee_rate(self, pair: str) -> float:
+        """Get taker fee rate for a specific pair from Kraken TradeVolume API"""
+        try:
+            result = await self._private_request('/0/private/TradeVolume', {'pair': pair})
+            
+            fees = result.get('fees', {})
+            if pair in fees:
+                fee_info = fees[pair]
+                taker_fee = float(fee_info.get('fee', '0.0026'))
+                logger.info(f"Kraken fee rate for {pair}: {taker_fee*100:.3f}% (from TradeVolume API)")
+                return taker_fee
+            
+            maker_fee = float(result.get('fees_maker', {}).get(pair, {}).get('fee', '0.0016'))
+            if maker_fee > 0:
+                logger.info(f"Kraken fee rate for {pair}: {maker_fee*100:.3f}% (maker fee from TradeVolume API)")
+                return maker_fee
+            
+            logger.warning(f"No pair-specific fee found for {pair}, using fallback 0.26%")
+            return 0.0026
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch fee rate from TradeVolume API: {e}. Using fallback 0.30%")
+            return 0.003
     
     def to_kraken_balance_key(self, coin: str) -> str:
         """Convert coin symbol to Kraken balance key format"""
@@ -781,41 +850,62 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     logger.info(f"Sell all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
                 elif alert.usd_amount:
-                    if alert.price:
-                        price_used = float(alert.price)
-                        raw_amount = alert.usd_amount / price_used
-                        logger.info(f"USD conversion: ${alert.usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
+                    if side == "buy":
+                        if alert.price:
+                            price_used = float(alert.price)
+                        else:
+                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, alert.usd_amount, price_used, balance_data)
                     else:
-                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = alert.usd_amount / current_price
-                        logger.info(f"USD conversion: ${alert.usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        if alert.price:
+                            price_used = float(alert.price)
+                            raw_amount = alert.usd_amount / price_used
+                            logger.info(f"USD conversion (sell): ${alert.usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
+                        else:
+                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                            raw_amount = alert.usd_amount / current_price
+                            logger.info(f"USD conversion (sell): ${alert.usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
                     coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
                     coin_balance = float(balance_data.get(coin_key, 0))
                     logger.info(f"Quantity all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
                 elif alert.quantity_usd:
-                    if alert.price:
-                        price_used = float(alert.price)
-                        raw_amount = alert.quantity_usd / price_used
-                        logger.info(f"USD conversion: ${alert.quantity_usd} / ${price_used} = {raw_amount:.8f} {coin}")
+                    if side == "buy":
+                        if alert.price:
+                            price_used = float(alert.price)
+                        else:
+                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, alert.quantity_usd, price_used, balance_data)
                     else:
-                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = alert.quantity_usd / current_price
-                        logger.info(f"USD conversion: ${alert.quantity_usd} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        if alert.price:
+                            price_used = float(alert.price)
+                            raw_amount = alert.quantity_usd / price_used
+                            logger.info(f"USD conversion (sell): ${alert.quantity_usd} / ${price_used} = {raw_amount:.8f} {coin}")
+                        else:
+                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                            raw_amount = alert.quantity_usd / current_price
+                            logger.info(f"USD conversion (sell): ${alert.quantity_usd} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity:
                     raw_amount = float(alert.quantity)
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif usdt_balance > 0:
                     position_size_usdt = calculate_position_size(usdt_balance, 0.02)
-                    if alert.price:
-                        raw_amount = position_size_usdt / float(alert.price)
+                    if side == "buy":
+                        if alert.price:
+                            price_used = float(alert.price)
+                        else:
+                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, position_size_usdt, price_used, balance_data)
                     else:
-                        current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        raw_amount = position_size_usdt / current_price
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        if alert.price:
+                            raw_amount = position_size_usdt / float(alert.price)
+                        else:
+                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                            raw_amount = position_size_usdt / current_price
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 else:
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, 0.001, side)
                 
