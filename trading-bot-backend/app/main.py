@@ -797,17 +797,22 @@ def get_exchange_instance(exchange_type: str, api_key: str, api_secret: str):
     
     return exchange
 
-def normalize_symbol(symbol: str, exchange_type: str) -> str:
+def normalize_symbol(symbol: str, exchange_type: str, prefer_usd: bool = False) -> str:
+    """
+    Normalize symbol to exchange format.
+    For Kraken: Can return pairs with /USD or /USDT depending on prefer_usd flag.
+    """
     symbol = symbol.upper().replace("USDT", "").replace("USD", "")
     
     if exchange_type == "kraken":
+        quote = "USD" if prefer_usd else "USDT"
         symbol_map = {
-            "BTC": "XBT/USDT",
-            "ETH": "ETH/USDT",
-            "SOL": "SOL/USDT",
-            "XRP": "XRP/USDT",
+            "BTC": f"XBT/{quote}",
+            "ETH": f"ETH/{quote}",
+            "SOL": f"SOL/{quote}",
+            "XRP": f"XRP/{quote}",
         }
-        return symbol_map.get(symbol, f"{symbol}/USDT")
+        return symbol_map.get(symbol, f"{symbol}/{quote}")
     elif exchange_type == "coinbase":
         return f"{symbol}-USDT"
     else:
@@ -968,7 +973,6 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             return result
         
         async def execute_trade():
-            symbol = normalize_symbol(alert.symbol, user_state.exchange_type)
             action = alert.action.lower()
             
             if action in ["buy", "long"]:
@@ -998,6 +1002,13 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
                 balance_data = await user_state.kraken_client.get_balance()
                 usdt_balance = float(balance_data.get('USDT', 0))
+                usd_balance = float(balance_data.get('ZUSD', 0))
+                
+                prefer_usd = (usdt_balance < 10 and usd_balance >= 10)
+                if prefer_usd:
+                    logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
+                
+                symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
                 kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
                 
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
