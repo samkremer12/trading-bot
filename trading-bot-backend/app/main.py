@@ -842,7 +842,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             else:
                 raise ValueError(f"Invalid action: {action}")
             
-            normalized_usd_amount = alert.usd or normalized_usd_amount or normalized_usd_amount
+            normalized_usd_amount = alert.usd or alert.usd_amount or alert.quantity_usd
             
             normalized_amount = None
             if alert.amount is not None:
