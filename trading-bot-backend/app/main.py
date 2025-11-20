@@ -830,9 +830,38 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
         user_state = users[username].state
         
         if not user_state.api_key or not user_state.api_secret:
-            user_state.api_connected = False
-            user_state.connection_error = None
-            return {"connected": False, "exchange": None, "error": None}
+            logger.info(f"API keys missing in memory for {username}, attempting DB fallback")
+            try:
+                db = SessionLocal()
+                user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                db.close()
+                
+                if user_db and user_db.api_key and user_db.api_secret:
+                    user_state.exchange_type = user_db.exchange_type
+                    
+                    if not user_state.exchange_type:
+                        user_state.exchange_type = "kraken"
+                        logger.info(f"Defaulting exchange_type to 'kraken' for {username} (was None in DB)")
+                    
+                    try:
+                        user_state.api_key = cipher.decrypt(user_db.api_key.encode()).decode()
+                        user_state.api_secret = cipher.decrypt(user_db.api_secret.encode()).decode()
+                        logger.info(f"Successfully loaded encrypted API keys from DB for {username}")
+                    except Exception as decrypt_err:
+                        logger.warning(f"Decrypt failed for {username}, treating as plaintext: {decrypt_err}")
+                        user_state.api_key = user_db.api_key
+                        user_state.api_secret = user_db.api_secret
+                        logger.info(f"Successfully loaded plaintext API keys from DB for {username}")
+                else:
+                    logger.info(f"No API keys found in DB for {username}")
+                    user_state.api_connected = False
+                    user_state.connection_error = None
+                    return {"connected": False, "exchange": None, "error": None}
+            except Exception as e:
+                logger.error(f"Failed to load API keys from DB for {username}: {str(e)}")
+                user_state.api_connected = False
+                user_state.connection_error = None
+                return {"connected": False, "exchange": None, "error": None}
         
         needs_rebuild = False
         if user_state.exchange_type == "kraken":
