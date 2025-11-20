@@ -839,6 +839,10 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
                 if user_db and user_db.api_key and user_db.api_secret:
                     user_state.exchange_type = user_db.exchange_type
                     
+                    if not user_state.exchange_type:
+                        user_state.exchange_type = "kraken"
+                        logger.info(f"Defaulting exchange_type to 'kraken' for {username} (was None in DB)")
+                    
                     try:
                         user_state.api_key = cipher.decrypt(user_db.api_key.encode()).decode()
                         user_state.api_secret = cipher.decrypt(user_db.api_secret.encode()).decode()
