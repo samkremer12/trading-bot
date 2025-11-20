@@ -813,6 +813,74 @@ def normalize_symbol(symbol: str, exchange_type: str) -> str:
     else:
         return f"{symbol}/USDT"
 
+user_hydration_locks: Dict[str, asyncio.Lock] = {}
+
+async def ensure_user_exchange_client(username: str, validate: bool = False) -> Dict[str, Any]:
+    """
+    Ensure user has a valid exchange client, rebuilding from DB if needed.
+    Returns: {connected: bool, exchange: str|None, error: str|None}
+    """
+    if username not in users:
+        return {"connected": False, "exchange": None, "error": "User not found"}
+    
+    if username not in user_hydration_locks:
+        user_hydration_locks[username] = asyncio.Lock()
+    
+    async with user_hydration_locks[username]:
+        user_state = users[username].state
+        
+        if not user_state.api_key or not user_state.api_secret:
+            user_state.api_connected = False
+            user_state.connection_error = None
+            return {"connected": False, "exchange": None, "error": None}
+        
+        needs_rebuild = False
+        if user_state.exchange_type == "kraken":
+            if user_state.kraken_client is None:
+                needs_rebuild = True
+        elif user_state.exchange_type:
+            if user_state.exchange is None:
+                needs_rebuild = True
+        else:
+            user_state.api_connected = False
+            user_state.connection_error = "No exchange type configured"
+            return {"connected": False, "exchange": None, "error": "No exchange type configured"}
+        
+        # Rebuild client if needed
+        if needs_rebuild:
+            try:
+                logger.info(f"Lazy-hydrating {user_state.exchange_type} client for user {username}")
+                if user_state.exchange_type == "kraken":
+                    user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                    if validate:
+                        await user_state.kraken_client.get_balance()
+                    user_state.api_connected = True
+                    user_state.connection_error = None
+                    logger.info(f"Successfully hydrated Kraken client for user {username}")
+                else:
+                    user_state.exchange = get_exchange_instance(
+                        user_state.exchange_type,
+                        user_state.api_key,
+                        user_state.api_secret
+                    )
+                    if validate:
+                        user_state.exchange.fetch_balance()
+                    user_state.api_connected = True
+                    user_state.connection_error = None
+                    logger.info(f"Successfully hydrated {user_state.exchange_type} client for user {username}")
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Failed to hydrate client for user {username}: {error_msg}")
+                user_state.api_connected = False
+                user_state.connection_error = error_msg
+                return {"connected": False, "exchange": user_state.exchange_type, "error": error_msg}
+        
+        return {
+            "connected": user_state.api_connected,
+            "exchange": user_state.exchange_type,
+            "error": user_state.connection_error
+        }
+
 async def execute_webhook_for_user(username: str, user_state: UserState, alert: WebhookAlert, timeout_seconds: int = 30) -> Dict[str, Any]:
     """
     Execute webhook for a single user with error handling and timeout.
@@ -1312,12 +1380,14 @@ async def get_settings(username: str = Depends(verify_session)):
     if username not in users:
         raise HTTPException(status_code=401, detail="User not found")
     
+    conn_status = await ensure_user_exchange_client(username, validate=False)
+    
     user_state = users[username].state
     return {
-        "exchange": user_state.exchange_type,
-        "connected": user_state.api_connected,
+        "exchange": conn_status["exchange"],
+        "connected": conn_status["connected"],
         "has_api_key": user_state.api_key is not None,
-        "error": user_state.connection_error
+        "error": conn_status["error"]
     }
 
 @app.post("/set-api-key")
@@ -1605,16 +1675,10 @@ async def get_status(username: str = Depends(verify_session)):
         if username not in users:
             raise HTTPException(status_code=401, detail="User not found")
         
+        conn_status = await ensure_user_exchange_client(username, validate=False)
+        api_connected = conn_status["connected"]
+        
         user_state = users[username].state
-        
-        api_connected = False
-        if user_state.exchange_type:
-            if user_state.exchange_type == "kraken" and user_state.kraken_client is not None:
-                api_connected = True
-            elif user_state.exchange is not None:
-                api_connected = True
-        
-        user_state.api_connected = api_connected
         
         total_trades = len(user_state.closed_trades) if user_state.closed_trades else 0
         winning_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) > 0]) if user_state.closed_trades else 0
