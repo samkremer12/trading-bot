@@ -94,6 +94,16 @@ function App() {
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
   const [copied, setCopied] = useState(false)
 
+  const formatTimestamp = (timestamp: string, options?: Intl.DateTimeFormatOptions) => {
+    const date = new Date(timestamp)
+    return date.toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      ...options
+    })
+  }
+
   useEffect(() => {
     const token = localStorage.getItem('authToken')
     const savedUsername = localStorage.getItem('username')
@@ -788,7 +798,7 @@ function App() {
                     <div className="flex justify-between items-start mb-2">
                       <div>
                         <div className="text-white font-bold">{trade.symbol}</div>
-                        <div className="text-xs text-slate-400">{new Date(trade.timestamp).toLocaleString()}</div>
+                        <div className="text-xs text-slate-400">{formatTimestamp(trade.timestamp)}</div>
                       </div>
                       <Badge className="bg-green-600">{trade.side}</Badge>
                     </div>
@@ -846,7 +856,7 @@ function App() {
                           ${trade.pnl?.toFixed(2)}
                         </div>
                         <div className="text-xs text-slate-400">
-                          {new Date(trade.timestamp).toLocaleTimeString()}
+                          {formatTimestamp(trade.timestamp, { dateStyle: undefined, timeStyle: 'short' })}
                         </div>
                       </div>
                     </div>
@@ -871,7 +881,7 @@ function App() {
                   <div key={idx} className="bg-slate-700 p-3 rounded-lg">
                     <div className="flex justify-between items-start mb-2">
                       <div className="text-xs text-slate-400">
-                        {new Date(log.timestamp).toLocaleString()}
+                        {formatTimestamp(log.timestamp)}
                       </div>
                       <Badge className={
                         log.status === 'executed' ? 'bg-green-600' :
