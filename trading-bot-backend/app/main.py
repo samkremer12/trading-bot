@@ -1572,56 +1572,86 @@ async def close_order(request: CloseOrderRequest, authenticated: bool = Depends(
 
 @app.get("/status")
 async def get_status(username: str = Depends(verify_session)):
-    if username not in users:
-        raise HTTPException(status_code=401, detail="User not found")
-    
-    user_state = users[username].state
-    
-    if not user_state.api_connected and os.path.exists(USERS_FILE):
-        logger.info(f"Self-heal: User {username} API not connected, attempting reconnect")
-        try:
-            await load_users_and_connect()
-        except Exception as e:
-            logger.error(f"Self-heal reconnect failed for user {username}: {str(e)}")
-    
-    api_connected = user_state.api_connected
-    
-    total_trades = len(user_state.closed_trades)
-    winning_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) > 0])
-    losing_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) < 0])
-    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-    
-    avg_trade_size = sum([t.get('amount', 0) for t in user_state.orders_history]) / len(user_state.orders_history) if user_state.orders_history else 0
-    
-    total_exposure = sum([t.get('amount', 0) * t.get('entry_price', 0) for t in user_state.open_trades])
-    
-    pnl_summary = {
-        "total_orders": len(user_state.orders_history),
-        "total_pnl": user_state.total_pnl,
-        "per_coin_pnl": user_state.per_coin_pnl,
-        "recent_orders": user_state.orders_history[-10:] if user_state.orders_history else [],
-        "winning_trades": winning_trades,
-        "losing_trades": losing_trades,
-        "win_rate": win_rate,
-        "avg_trade_size": avg_trade_size,
-        "total_exposure": total_exposure
-    }
-    
-    return {
-        "api_connected": api_connected,
-        "exchange": user_state.exchange_type if api_connected else None,
-        "auto_trading_enabled": user_state.auto_trading_enabled,
-        "emergency_stop": user_state.emergency_stop,
-        "stop_loss_enabled": user_state.stop_loss_enabled,
-        "stop_loss_pct": user_state.stop_loss_pct,
-        "coin_trading_enabled": user_state.coin_trading_enabled,
-        "last_webhook": user_state.last_webhook,
-        "last_order": user_state.last_order,
-        "pnl_summary": pnl_summary,
-        "open_trades": user_state.open_trades,
-        "closed_trades": user_state.closed_trades[-20:] if user_state.closed_trades else [],
-        "webhook_logs": user_state.webhook_logs[-50:] if user_state.webhook_logs else []
-    }
+    try:
+        if username not in users:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        user_state = users[username].state
+        
+        api_connected = False
+        if user_state.exchange_type:
+            if user_state.exchange_type == "kraken" and user_state.kraken_client is not None:
+                api_connected = True
+            elif user_state.exchange is not None:
+                api_connected = True
+        
+        user_state.api_connected = api_connected
+        
+        total_trades = len(user_state.closed_trades) if user_state.closed_trades else 0
+        winning_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) > 0]) if user_state.closed_trades else 0
+        losing_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) < 0]) if user_state.closed_trades else 0
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        avg_trade_size = sum([t.get('amount', 0) for t in user_state.orders_history]) / len(user_state.orders_history) if user_state.orders_history else 0
+        
+        total_exposure = sum([t.get('amount', 0) * t.get('entry_price', 0) for t in user_state.open_trades]) if user_state.open_trades else 0
+        
+        pnl_summary = {
+            "total_orders": len(user_state.orders_history) if user_state.orders_history else 0,
+            "total_pnl": user_state.total_pnl if user_state.total_pnl else 0.0,
+            "per_coin_pnl": user_state.per_coin_pnl if user_state.per_coin_pnl else {},
+            "recent_orders": user_state.orders_history[-10:] if user_state.orders_history else [],
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "win_rate": win_rate,
+            "avg_trade_size": avg_trade_size,
+            "total_exposure": total_exposure
+        }
+        
+        return {
+            "api_connected": api_connected,
+            "exchange": user_state.exchange_type if api_connected else None,
+            "auto_trading_enabled": user_state.auto_trading_enabled if user_state.auto_trading_enabled is not None else False,
+            "emergency_stop": user_state.emergency_stop if user_state.emergency_stop is not None else False,
+            "stop_loss_enabled": user_state.stop_loss_enabled if user_state.stop_loss_enabled is not None else True,
+            "stop_loss_pct": user_state.stop_loss_pct if user_state.stop_loss_pct is not None else 0.02,
+            "coin_trading_enabled": user_state.coin_trading_enabled if user_state.coin_trading_enabled else {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
+            "last_webhook": user_state.last_webhook,
+            "last_order": user_state.last_order,
+            "pnl_summary": pnl_summary,
+            "open_trades": user_state.open_trades if user_state.open_trades else [],
+            "closed_trades": user_state.closed_trades[-20:] if user_state.closed_trades else [],
+            "webhook_logs": user_state.webhook_logs[-50:] if user_state.webhook_logs else []
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error in get_status for user {username}: {str(e)}")
+        return {
+            "api_connected": False,
+            "exchange": None,
+            "auto_trading_enabled": False,
+            "emergency_stop": False,
+            "stop_loss_enabled": True,
+            "stop_loss_pct": 0.02,
+            "coin_trading_enabled": {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
+            "last_webhook": None,
+            "last_order": None,
+            "pnl_summary": {
+                "total_orders": 0,
+                "total_pnl": 0.0,
+                "per_coin_pnl": {},
+                "recent_orders": [],
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "win_rate": 0,
+                "avg_trade_size": 0,
+                "total_exposure": 0
+            },
+            "open_trades": [],
+            "closed_trades": [],
+            "webhook_logs": []
+        }
 
 @app.post("/test-webhook")
 async def test_webhook(username: str = Depends(verify_session)):
