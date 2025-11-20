@@ -830,9 +830,30 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
         user_state = users[username].state
         
         if not user_state.api_key or not user_state.api_secret:
-            user_state.api_connected = False
-            user_state.connection_error = None
-            return {"connected": False, "exchange": None, "error": None}
+            logger.info(f"API keys missing in memory for {username}, attempting DB fallback")
+            try:
+                db = SessionLocal()
+                user_data = db.execute(
+                    "SELECT exchange_type, encrypted_api_key, encrypted_api_secret FROM users WHERE username = ?",
+                    (username,)
+                ).fetchone()
+                db.close()
+                
+                if user_data and user_data[1] and user_data[2]:
+                    user_state.exchange_type = user_data[0]
+                    user_state.api_key = cipher.decrypt(user_data[1].encode()).decode()
+                    user_state.api_secret = cipher.decrypt(user_data[2].encode()).decode()
+                    logger.info(f"Successfully loaded API keys from DB for {username}")
+                else:
+                    logger.info(f"No API keys found in DB for {username}")
+                    user_state.api_connected = False
+                    user_state.connection_error = None
+                    return {"connected": False, "exchange": None, "error": None}
+            except Exception as e:
+                logger.error(f"Failed to load API keys from DB for {username}: {str(e)}")
+                user_state.api_connected = False
+                user_state.connection_error = None
+                return {"connected": False, "exchange": None, "error": None}
         
         needs_rebuild = False
         if user_state.exchange_type == "kraken":
