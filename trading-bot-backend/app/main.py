@@ -833,16 +833,13 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
             logger.info(f"API keys missing in memory for {username}, attempting DB fallback")
             try:
                 db = SessionLocal()
-                user_data = db.execute(
-                    "SELECT exchange_type, encrypted_api_key, encrypted_api_secret FROM users WHERE username = ?",
-                    (username,)
-                ).fetchone()
+                user_db = db.query(UserDB).filter(UserDB.username == username).first()
                 db.close()
                 
-                if user_data and user_data[1] and user_data[2]:
-                    user_state.exchange_type = user_data[0]
-                    user_state.api_key = cipher.decrypt(user_data[1].encode()).decode()
-                    user_state.api_secret = cipher.decrypt(user_data[2].encode()).decode()
+                if user_db and user_db.api_key and user_db.api_secret:
+                    user_state.exchange_type = user_db.exchange_type
+                    user_state.api_key = cipher.decrypt(user_db.api_key.encode()).decode()
+                    user_state.api_secret = cipher.decrypt(user_db.api_secret.encode()).decode()
                     logger.info(f"Successfully loaded API keys from DB for {username}")
                 else:
                     logger.info(f"No API keys found in DB for {username}")
