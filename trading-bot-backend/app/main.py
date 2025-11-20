@@ -1,7 +1,10 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List, Union
+from decimal import Decimal
 import ccxt
 from cryptography.fernet import Fernet
 from datetime import datetime, timedelta, timezone
@@ -34,6 +37,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
 
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
@@ -88,6 +106,7 @@ def create_jwt_token(username: str) -> str:
 def verify_session(authorization: Optional[str] = Header(None)) -> str:
     """Verify JWT token and return username"""
     if not authorization:
+        logger.warning("verify_session: Missing authorization header")
         raise HTTPException(status_code=401, detail="Not authenticated")
     
     token = authorization.replace("Bearer ", "")
@@ -96,11 +115,15 @@ def verify_session(authorization: Optional[str] = Header(None)) -> str:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         username = payload.get("sub")
         if not username:
+            logger.warning("verify_session: Invalid token payload - no username")
             raise HTTPException(status_code=401, detail="Invalid token")
+        logger.debug(f"verify_session: Successfully authenticated user: {username}")
         return username
     except jwt.ExpiredSignatureError:
+        logger.warning("verify_session: Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"verify_session: Invalid token - {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def check_rate_limit() -> bool:
@@ -1086,6 +1109,10 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
 async def healthz():
     return {"status": "ok"}
 
+@app.get("/version")
+def version():
+    return {"version": "v1.1.0-json-fix", "commit": "status-json-serialization-fix", "timestamp": "2025-11-20T18:32:00Z"}
+
 @app.post("/register")
 async def register(request: RegisterRequest):
     """Register a new user"""
@@ -1573,6 +1600,8 @@ async def close_order(request: CloseOrderRequest, authenticated: bool = Depends(
 @app.get("/status")
 async def get_status(username: str = Depends(verify_session)):
     try:
+        logger.info(f"get_status called for user: {username}")
+        
         if username not in users:
             raise HTTPException(status_code=401, detail="User not found")
         
@@ -1598,36 +1627,40 @@ async def get_status(username: str = Depends(verify_session)):
         
         pnl_summary = {
             "total_orders": len(user_state.orders_history) if user_state.orders_history else 0,
-            "total_pnl": user_state.total_pnl if user_state.total_pnl else 0.0,
-            "per_coin_pnl": user_state.per_coin_pnl if user_state.per_coin_pnl else {},
+            "total_pnl": float(user_state.total_pnl) if user_state.total_pnl else 0.0,
+            "per_coin_pnl": {k: float(v) for k, v in (user_state.per_coin_pnl or {}).items()},
             "recent_orders": user_state.orders_history[-10:] if user_state.orders_history else [],
             "winning_trades": winning_trades,
             "losing_trades": losing_trades,
-            "win_rate": win_rate,
-            "avg_trade_size": avg_trade_size,
-            "total_exposure": total_exposure
+            "win_rate": float(win_rate),
+            "avg_trade_size": float(avg_trade_size),
+            "total_exposure": float(total_exposure)
         }
         
-        return {
+        payload = {
             "api_connected": api_connected,
             "exchange": user_state.exchange_type if api_connected else None,
             "auto_trading_enabled": user_state.auto_trading_enabled if user_state.auto_trading_enabled is not None else False,
             "emergency_stop": user_state.emergency_stop if user_state.emergency_stop is not None else False,
             "stop_loss_enabled": user_state.stop_loss_enabled if user_state.stop_loss_enabled is not None else True,
-            "stop_loss_pct": user_state.stop_loss_pct if user_state.stop_loss_pct is not None else 0.02,
+            "stop_loss_pct": float(user_state.stop_loss_pct) if user_state.stop_loss_pct is not None else 0.02,
             "coin_trading_enabled": user_state.coin_trading_enabled if user_state.coin_trading_enabled else {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
             "last_webhook": user_state.last_webhook,
             "last_order": user_state.last_order,
             "pnl_summary": pnl_summary,
-            "open_trades": user_state.open_trades if user_state.open_trades else [],
+            "open_trades": user_state.open_trades[-20:] if user_state.open_trades else [],
             "closed_trades": user_state.closed_trades[-20:] if user_state.closed_trades else [],
             "webhook_logs": user_state.webhook_logs[-50:] if user_state.webhook_logs else []
         }
+        
+        logger.info(f"get_status returning payload with {len(payload)} keys for user {username}")
+        return JSONResponse(content=jsonable_encoder(payload, custom_encoder={Decimal: float}))
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.exception(f"Error in get_status for user {username}: {str(e)}")
-        return {
+        fallback_payload = {
             "api_connected": False,
             "exchange": None,
             "auto_trading_enabled": False,
@@ -1652,6 +1685,7 @@ async def get_status(username: str = Depends(verify_session)):
             "closed_trades": [],
             "webhook_logs": []
         }
+        return JSONResponse(content=jsonable_encoder(fallback_payload, custom_encoder={Decimal: float}))
 
 @app.post("/test-webhook")
 async def test_webhook(username: str = Depends(verify_session)):
