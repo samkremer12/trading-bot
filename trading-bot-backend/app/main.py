@@ -38,6 +38,21 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
     CORSMiddleware,
@@ -91,6 +106,7 @@ def create_jwt_token(username: str) -> str:
 def verify_session(authorization: Optional[str] = Header(None)) -> str:
     """Verify JWT token and return username"""
     if not authorization:
+        logger.warning("verify_session: Missing authorization header")
         raise HTTPException(status_code=401, detail="Not authenticated")
     
     token = authorization.replace("Bearer ", "")
@@ -99,11 +115,15 @@ def verify_session(authorization: Optional[str] = Header(None)) -> str:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         username = payload.get("sub")
         if not username:
+            logger.warning("verify_session: Invalid token payload - no username")
             raise HTTPException(status_code=401, detail="Invalid token")
+        logger.debug(f"verify_session: Successfully authenticated user: {username}")
         return username
     except jwt.ExpiredSignatureError:
+        logger.warning("verify_session: Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"verify_session: Invalid token - {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def check_rate_limit() -> bool:
