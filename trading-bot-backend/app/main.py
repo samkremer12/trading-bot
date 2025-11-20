@@ -194,7 +194,9 @@ async def calculate_fee_aware_buy_volume(kraken_client, pair: str, usd_amount: f
         
         fee_rate = await kraken_client.get_fee_rate(pair)
         
-        quote_balance = float(balance_data.get(quote, 0))
+        quote_balance_key = kraken_client.to_kraken_balance_key(quote)
+        quote_balance = float(balance_data.get(quote_balance_key, 0))
+        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, balance=${quote_balance:.2f}")
         
         spend_cap = min(usd_amount, quote_balance / (1 + fee_rate))
         
@@ -1009,7 +1011,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
                 
                 symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
-                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                kraken_pair = user_state.kraken_client.to_kraken_pair(symbol)
                 
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
