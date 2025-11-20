@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import ccxt
 from cryptography.fernet import Fernet
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from enum import Enum
@@ -123,7 +123,7 @@ def check_user_rate_limit(user_state: 'UserState', max_requests: int = 20, windo
 def log_event(user_state: 'UserState', action: str, status: str, details: Optional[Dict] = None, error: Optional[str] = None):
     """Log critical events for auditing"""
     event = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
         "status": status,
         "details": details or {},
@@ -790,7 +790,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
     """
     result = {
         "username": username,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": "pending",
         "executed": False,
         "error": None,
@@ -1013,7 +1013,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
             
             trade = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol,
                 "coin": coin,
                 "side": side,
@@ -1433,7 +1433,7 @@ async def webhook(alert: WebhookAlert):
             
             if result.get("executed"):
                 user_state.last_webhook = {
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "payload": alert.dict()
                 }
         
@@ -1484,7 +1484,7 @@ async def place_order(request: OrderRequest, authenticated: bool = Depends(verif
             raise HTTPException(status_code=400, detail="Invalid order type or missing price for limit order")
         
         state.last_order = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol,
             "side": request.side,
             "amount": request.amount,
@@ -1520,7 +1520,7 @@ async def close_order(request: CloseOrderRequest, authenticated: bool = Depends(
             order = state.exchange.create_market_order(symbol, 'sell', amount)
             
             state.last_order = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol,
                 "side": "sell",
                 "amount": amount,
@@ -1748,7 +1748,7 @@ async def monitor_stop_loss():
                                 closed_trade['exit_price'] = exit_price
                                 closed_trade['pnl'] = pnl
                                 closed_trade['closed_by'] = 'stop_loss'
-                                closed_trade['closed_at'] = datetime.now().isoformat()
+                                closed_trade['closed_at'] = datetime.now(timezone.utc).isoformat()
                                 
                                 user_state.closed_trades.append(closed_trade)
                                 user_state.open_trades.remove(trade)
@@ -1759,7 +1759,7 @@ async def monitor_stop_loss():
                                 user_state.total_pnl += pnl
                                 
                                 webhook_log = {
-                                    "timestamp": datetime.now().isoformat(),
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "payload": {
                                         "action": "stop_loss",
                                         "symbol": trade.get('raw_symbol'),
@@ -1782,7 +1782,7 @@ async def monitor_stop_loss():
                             logger.error(f"User {username}: {error_msg}")
                             
                             webhook_log = {
-                                "timestamp": datetime.now().isoformat(),
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "payload": {
                                     "action": "stop_loss_failed",
                                     "symbol": trade.get('raw_symbol'),
