@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import ccxt
 from cryptography.fernet import Fernet
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import json
 import os
 from enum import Enum
@@ -48,6 +49,10 @@ WEBHOOK_SECRET = "Samkremer12"
 JWT_SECRET = os.environ.get("JWT_SECRET", "trading-bot-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 30
+
+def now_et_iso() -> str:
+    """Return current timestamp in America/New_York timezone as ISO string"""
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).isoformat()
 webhook_request_times = []
 processed_idempotency_keys = {}
 IDEMPOTENCY_TTL_SECONDS = 3600
@@ -123,7 +128,7 @@ def check_user_rate_limit(user_state: 'UserState', max_requests: int = 20, windo
 def log_event(user_state: 'UserState', action: str, status: str, details: Optional[Dict] = None, error: Optional[str] = None):
     """Log critical events for auditing"""
     event = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_et_iso(),
         "action": action,
         "status": status,
         "details": details or {},
@@ -704,8 +709,10 @@ class WebhookAlert(BaseModel):
     stop_loss: Optional[str] = None
     take_profit: Optional[str] = None
     quantity: Optional[Any] = None
+    amount: Optional[Union[float, str]] = None
     quantity_usd: Optional[float] = None
     usd_amount: Optional[float] = None
+    usd: Optional[float] = None
     sell_all: Optional[bool] = None
     timestamp: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -790,7 +797,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
     """
     result = {
         "username": username,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_et_iso(),
         "status": "pending",
         "executed": False,
         "error": None,
@@ -835,6 +842,15 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             else:
                 raise ValueError(f"Invalid action: {action}")
             
+            normalized_usd_amount = alert.usd or normalized_usd_amount or normalized_usd_amount
+            
+            normalized_amount = None
+            if alert.amount is not None:
+                if isinstance(alert.amount, str) and alert.amount.lower() == "all":
+                    normalized_amount = "all"
+                else:
+                    normalized_amount = float(alert.amount)
+            
             amount = 0.001  # default
             
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
@@ -844,49 +860,52 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
-                if alert.sell_all:
+                if alert.sell_all or normalized_amount == "all":
                     coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
                     coin_balance = float(balance_data.get(coin_key, 0))
                     logger.info(f"Sell all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                elif alert.usd_amount:
+                elif normalized_usd_amount:
                     if side == "buy":
                         if alert.price:
                             price_used = float(alert.price)
                         else:
                             price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, alert.usd_amount, price_used, balance_data)
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, normalized_usd_amount, price_used, balance_data)
                     else:
                         if alert.price:
                             price_used = float(alert.price)
-                            raw_amount = alert.usd_amount / price_used
-                            logger.info(f"USD conversion (sell): ${alert.usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
+                            raw_amount = normalized_usd_amount / price_used
+                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
                         else:
                             current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = alert.usd_amount / current_price
-                            logger.info(f"USD conversion (sell): ${alert.usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                            raw_amount = normalized_usd_amount / current_price
+                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
                         amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                elif normalized_amount and normalized_amount != "all":
+                    raw_amount = float(normalized_amount)
+                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
                     coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
                     coin_balance = float(balance_data.get(coin_key, 0))
                     logger.info(f"Quantity all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                elif alert.quantity_usd:
+                elif normalized_usd_amount:
                     if side == "buy":
                         if alert.price:
                             price_used = float(alert.price)
                         else:
                             price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, alert.quantity_usd, price_used, balance_data)
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, normalized_usd_amount, price_used, balance_data)
                     else:
                         if alert.price:
                             price_used = float(alert.price)
-                            raw_amount = alert.quantity_usd / price_used
-                            logger.info(f"USD conversion (sell): ${alert.quantity_usd} / ${price_used} = {raw_amount:.8f} {coin}")
+                            raw_amount = normalized_usd_amount / price_used
+                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
                         else:
                             current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = alert.quantity_usd / current_price
-                            logger.info(f"USD conversion (sell): ${alert.quantity_usd} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                            raw_amount = normalized_usd_amount / current_price
+                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
                         amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif alert.quantity:
                     raw_amount = float(alert.quantity)
@@ -963,23 +982,23 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 if alert.sell_all:
                     coin_balance = balance.get(coin, {}).get('free', 0)
                     amount = coin_balance
-                elif alert.usd_amount:
+                elif normalized_usd_amount:
                     if alert.price:
-                        amount = alert.usd_amount / float(alert.price)
+                        amount = normalized_usd_amount / float(alert.price)
                     else:
                         ticker = user_state.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
-                        amount = alert.usd_amount / current_price
+                        amount = normalized_usd_amount / current_price
                 elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
                     coin_balance = balance.get(coin, {}).get('free', 0)
                     amount = coin_balance
-                elif alert.quantity_usd:
+                elif normalized_usd_amount:
                     if alert.price:
-                        amount = alert.quantity_usd / float(alert.price)
+                        amount = normalized_usd_amount / float(alert.price)
                     else:
                         ticker = user_state.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
-                        amount = alert.quantity_usd / current_price
+                        amount = normalized_usd_amount / current_price
                 elif alert.quantity:
                     amount = float(alert.quantity)
                 elif usdt_balance > 0:
@@ -1013,7 +1032,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
             
             trade = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": now_et_iso(),
                 "symbol": symbol,
                 "coin": coin,
                 "side": side,
@@ -1433,7 +1452,7 @@ async def webhook(alert: WebhookAlert):
             
             if result.get("executed"):
                 user_state.last_webhook = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": now_et_iso(),
                     "payload": alert.dict()
                 }
         
@@ -1484,7 +1503,7 @@ async def place_order(request: OrderRequest, authenticated: bool = Depends(verif
             raise HTTPException(status_code=400, detail="Invalid order type or missing price for limit order")
         
         state.last_order = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_et_iso(),
             "symbol": symbol,
             "side": request.side,
             "amount": request.amount,
@@ -1520,7 +1539,7 @@ async def close_order(request: CloseOrderRequest, authenticated: bool = Depends(
             order = state.exchange.create_market_order(symbol, 'sell', amount)
             
             state.last_order = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": now_et_iso(),
                 "symbol": symbol,
                 "side": "sell",
                 "amount": amount,
@@ -1748,7 +1767,7 @@ async def monitor_stop_loss():
                                 closed_trade['exit_price'] = exit_price
                                 closed_trade['pnl'] = pnl
                                 closed_trade['closed_by'] = 'stop_loss'
-                                closed_trade['closed_at'] = datetime.now(timezone.utc).isoformat()
+                                closed_trade['closed_at'] = now_et_iso()
                                 
                                 user_state.closed_trades.append(closed_trade)
                                 user_state.open_trades.remove(trade)
@@ -1759,7 +1778,7 @@ async def monitor_stop_loss():
                                 user_state.total_pnl += pnl
                                 
                                 webhook_log = {
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "timestamp": now_et_iso(),
                                     "payload": {
                                         "action": "stop_loss",
                                         "symbol": trade.get('raw_symbol'),
@@ -1782,7 +1801,7 @@ async def monitor_stop_loss():
                             logger.error(f"User {username}: {error_msg}")
                             
                             webhook_log = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": now_et_iso(),
                                 "payload": {
                                     "action": "stop_loss_failed",
                                     "symbol": trade.get('raw_symbol'),
