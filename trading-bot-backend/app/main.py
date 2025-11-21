@@ -292,16 +292,24 @@ async def round_and_enforce_kraken_volume(kraken_client, pair: str, symbol: str,
 class KrakenClient:
     """Direct Kraken API client with proper HMAC-SHA512 authentication"""
     
-    def __init__(self, api_key: str, api_secret: str):
+    def __init__(self, api_key: str, api_secret: str, username: str = None):
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
         self.base_url = "https://api.kraken.com"
-        self.nonce_counter = int(time.time() * 1000)
+        self.username = username
         
     def _get_nonce(self) -> str:
-        """Generate strictly increasing nonce"""
-        self.nonce_counter += 1
-        return str(self.nonce_counter)
+        """Generate strictly increasing nonce using DB-backed persistence"""
+        if self.username:
+            from app.database import SessionLocal, get_and_increment_nonce
+            db = SessionLocal()
+            try:
+                nonce = get_and_increment_nonce(db, self.username)
+                return str(nonce)
+            finally:
+                db.close()
+        else:
+            return str(int(time.time() * 1_000_000))
     
     def _sign_request(self, path: str, data: Dict[str, Any]) -> str:
         """Generate HMAC-SHA512 signature for Kraken API"""
@@ -642,7 +650,7 @@ async def load_users_and_connect():
                         user_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
                         
                         if user_state.exchange_type == "kraken":
-                            user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                            user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret, username)
                             balance_data = await user_state.kraken_client.get_balance()
                             user_state.api_connected = True
                             user_state.connection_error = None
@@ -700,7 +708,7 @@ async def migrate_legacy_state():
                 admin_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
                 
                 if admin_state.exchange_type == "kraken":
-                    admin_state.kraken_client = KrakenClient(admin_state.api_key, admin_state.api_secret)
+                    admin_state.kraken_client = KrakenClient(admin_state.api_key, admin_state.api_secret, "admin")
                     balance_data = await admin_state.kraken_client.get_balance()
                     admin_state.api_connected = True
                     admin_state.connection_error = None
@@ -908,7 +916,7 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
             try:
                 logger.info(f"Lazy-hydrating {user_state.exchange_type} client for user {username}")
                 if user_state.exchange_type == "kraken":
-                    user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                    user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret, username)
                     if validate:
                         await user_state.kraken_client.get_balance()
                     user_state.api_connected = True
@@ -1347,7 +1355,7 @@ async def save_settings(request: ApiSettingsRequest, username: str = Depends(ver
         
         if exchange == "kraken":
             try:
-                kraken_client = KrakenClient(api_key, api_secret)
+                kraken_client = KrakenClient(api_key, api_secret, username)
                 
                 logger.info(f"Testing Kraken API connection for user {username}...")
                 balance = await kraken_client.get_balance()
