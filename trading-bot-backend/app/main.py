@@ -1751,6 +1751,8 @@ async def close_order(request: CloseOrderRequest, authenticated: bool = Depends(
 
 @app.get("/status")
 async def get_status(username: str = Depends(verify_session)):
+    conn_status = {"connected": False, "exchange": None, "error": None}
+    
     try:
         logger.info(f"get_status called for user: {username}")
         
@@ -1759,33 +1761,57 @@ async def get_status(username: str = Depends(verify_session)):
         
         conn_status = await ensure_user_exchange_client(username, validate=False)
         api_connected = conn_status["connected"]
+        exchange = conn_status["exchange"]
         
         user_state = users[username].state
         
-        total_trades = len(user_state.closed_trades) if user_state.closed_trades else 0
-        winning_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) > 0]) if user_state.closed_trades else 0
-        losing_trades = len([t for t in user_state.closed_trades if t.get('pnl', 0) < 0]) if user_state.closed_trades else 0
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        
-        avg_trade_size = sum([t.get('amount', 0) for t in user_state.orders_history]) / len(user_state.orders_history) if user_state.orders_history else 0
-        
-        total_exposure = sum([t.get('amount', 0) * t.get('entry_price', 0) for t in user_state.open_trades]) if user_state.open_trades else 0
-        
-        pnl_summary = {
-            "total_orders": len(user_state.orders_history) if user_state.orders_history else 0,
-            "total_pnl": float(user_state.total_pnl) if user_state.total_pnl else 0.0,
-            "per_coin_pnl": {k: float(v) for k, v in (user_state.per_coin_pnl or {}).items()},
-            "recent_orders": user_state.orders_history[-10:] if user_state.orders_history else [],
-            "winning_trades": winning_trades,
-            "losing_trades": losing_trades,
-            "win_rate": float(win_rate),
-            "avg_trade_size": float(avg_trade_size),
-            "total_exposure": float(total_exposure)
-        }
+        try:
+            # Normalize lists to ensure they're valid and contain only dicts
+            closed_trades = [t for t in (user_state.closed_trades or []) if isinstance(t, dict)]
+            orders_history = [o for o in (user_state.orders_history or []) if isinstance(o, dict)]
+            open_trades = [t for t in (user_state.open_trades or []) if isinstance(t, dict)]
+            webhook_logs = [w for w in (user_state.webhook_logs or []) if isinstance(w, dict)]
+            
+            total_trades = len(closed_trades)
+            winning_trades = len([t for t in closed_trades if t.get('pnl', 0) > 0])
+            losing_trades = len([t for t in closed_trades if t.get('pnl', 0) < 0])
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            avg_trade_size = sum([o.get('amount', 0) for o in orders_history]) / len(orders_history) if orders_history else 0
+            
+            total_exposure = sum([t.get('amount', 0) * t.get('entry_price', 0) for t in open_trades])
+            
+            pnl_summary = {
+                "total_orders": len(orders_history),
+                "total_pnl": float(user_state.total_pnl) if user_state.total_pnl else 0.0,
+                "per_coin_pnl": {k: float(v) for k, v in (user_state.per_coin_pnl or {}).items()},
+                "recent_orders": orders_history[-10:],
+                "winning_trades": winning_trades,
+                "losing_trades": losing_trades,
+                "win_rate": float(win_rate),
+                "avg_trade_size": float(avg_trade_size),
+                "total_exposure": float(total_exposure)
+            }
+        except Exception as stats_error:
+            logger.warning(f"Stats calculation failed for user {username}: {str(stats_error)}, using defaults")
+            closed_trades = []
+            open_trades = []
+            webhook_logs = []
+            pnl_summary = {
+                "total_orders": 0,
+                "total_pnl": 0.0,
+                "per_coin_pnl": {},
+                "recent_orders": [],
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "win_rate": 0,
+                "avg_trade_size": 0,
+                "total_exposure": 0
+            }
         
         payload = {
             "api_connected": api_connected,
-            "exchange": user_state.exchange_type if api_connected else None,
+            "exchange": exchange,
             "auto_trading_enabled": user_state.auto_trading_enabled if user_state.auto_trading_enabled is not None else False,
             "emergency_stop": user_state.emergency_stop if user_state.emergency_stop is not None else False,
             "stop_loss_enabled": user_state.stop_loss_enabled if user_state.stop_loss_enabled is not None else True,
@@ -1794,12 +1820,12 @@ async def get_status(username: str = Depends(verify_session)):
             "last_webhook": user_state.last_webhook,
             "last_order": user_state.last_order,
             "pnl_summary": pnl_summary,
-            "open_trades": user_state.open_trades[-20:] if user_state.open_trades else [],
-            "closed_trades": user_state.closed_trades[-20:] if user_state.closed_trades else [],
-            "webhook_logs": user_state.webhook_logs[-50:] if user_state.webhook_logs else []
+            "open_trades": open_trades[-20:],
+            "closed_trades": closed_trades[-20:],
+            "webhook_logs": webhook_logs[-50:]
         }
         
-        logger.info(f"get_status returning payload with {len(payload)} keys for user {username}")
+        logger.info(f"get_status returning payload for user {username}: api_connected={api_connected}, exchange={exchange}")
         return JSONResponse(content=jsonable_encoder(payload, custom_encoder={Decimal: float}))
         
     except HTTPException:
@@ -1807,8 +1833,8 @@ async def get_status(username: str = Depends(verify_session)):
     except Exception as e:
         logger.exception(f"Error in get_status for user {username}: {str(e)}")
         fallback_payload = {
-            "api_connected": False,
-            "exchange": None,
+            "api_connected": conn_status["connected"],
+            "exchange": conn_status["exchange"],
             "auto_trading_enabled": False,
             "emergency_stop": False,
             "stop_loss_enabled": True,
