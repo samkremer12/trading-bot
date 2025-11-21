@@ -1859,6 +1859,56 @@ async def get_status(username: str = Depends(verify_session)):
         }
         return JSONResponse(content=jsonable_encoder(fallback_payload, custom_encoder={Decimal: float}))
 
+@app.get("/api/diagnostics/balance")
+async def get_balance_diagnostics(username: str = Depends(verify_session)):
+    """Diagnostic endpoint to check balance and pair info"""
+    if username not in users:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    user_state = users[username].state
+    
+    if not user_state.kraken_client:
+        raise HTTPException(status_code=400, detail="Kraken client not configured")
+    
+    try:
+        balance_data = await user_state.kraken_client.get_balance()
+        
+        pair_info_btc = await user_state.kraken_client.get_asset_pairs("XBTUSDT")
+        pair_info_eth = await user_state.kraken_client.get_asset_pairs("ETHUSDT")
+        
+        return {
+            "balance_keys": list(balance_data.keys()),
+            "balances": {
+                "USDT": float(balance_data.get('USDT', 0)),
+                "ZUSD": float(balance_data.get('ZUSD', 0)),
+                "XXBT": float(balance_data.get('XXBT', 0)),
+                "XETH": float(balance_data.get('XETH', 0))
+            },
+            "pair_info": {
+                "XBTUSDT": {
+                    "quote": pair_info_btc.get('quote'),
+                    "ordermin": pair_info_btc.get('ordermin'),
+                    "lot_decimals": pair_info_btc.get('lot_decimals'),
+                    "pair_decimals": pair_info_btc.get('pair_decimals')
+                },
+                "ETHUSDT": {
+                    "quote": pair_info_eth.get('quote'),
+                    "ordermin": pair_info_eth.get('ordermin'),
+                    "lot_decimals": pair_info_eth.get('lot_decimals'),
+                    "pair_decimals": pair_info_eth.get('pair_decimals')
+                }
+            },
+            "balance_key_mapping": {
+                "USDT": user_state.kraken_client.to_kraken_balance_key("USDT"),
+                "USD": user_state.kraken_client.to_kraken_balance_key("USD"),
+                "BTC": user_state.kraken_client.to_kraken_balance_key("BTC"),
+                "ETH": user_state.kraken_client.to_kraken_balance_key("ETH")
+            }
+        }
+    except Exception as e:
+        logger.exception(f"Balance diagnostics error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/test-webhook")
 async def test_webhook(username: str = Depends(verify_session)):
     if username not in users:
