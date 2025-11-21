@@ -359,9 +359,13 @@ class KrakenClient:
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         
+        logger.info(f"Kraken API Request: endpoint={endpoint}, data={data}")
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(url, data=data, headers=headers)
             result = response.json()
+            
+            logger.info(f"Kraken API Response: endpoint={endpoint}, result={result}")
             
             if result.get('error') and len(result['error']) > 0:
                 error_msg = ', '.join(result['error'])
