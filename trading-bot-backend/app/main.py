@@ -373,7 +373,7 @@ class KrakenClient:
         """Get account balance"""
         return await self._private_request('Balance')
     
-    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None, validate: bool = False) -> Dict[str, Any]:
         """Place an order on Kraken"""
         data = {
             'pair': pair,
@@ -384,6 +384,9 @@ class KrakenClient:
         
         if price and order_type == 'limit':
             data['price'] = str(price)
+        
+        if validate:
+            data['validate'] = 'true'
         
         return await self._private_request('AddOrder', data)
     
@@ -1035,6 +1038,20 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             amount = 0.001  # default
             
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
+                try:
+                    open_orders_data = await user_state.kraken_client.get_open_orders()
+                    open_orders = open_orders_data.get('open', {})
+                    if open_orders:
+                        logger.info(f"Found {len(open_orders)} open orders, canceling to free held funds")
+                        for order_id in open_orders.keys():
+                            try:
+                                await user_state.kraken_client.cancel_order(order_id)
+                                logger.info(f"Canceled order {order_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to cancel order {order_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error checking/canceling open orders: {e}")
+                
                 balance_data = await user_state.kraken_client.get_balance()
                 usdt_balance = float(balance_data.get('USDT', 0))
                 usd_balance = float(balance_data.get('ZUSD', 0))
