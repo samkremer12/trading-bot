@@ -373,17 +373,22 @@ class KrakenClient:
         return await self._private_request('ClosedOrders')
     
     def to_kraken_pair(self, symbol: str) -> str:
-        """Convert standard symbol to Kraken pair format"""
-        symbol = symbol.upper().replace("USDT", "").replace("USD", "")
+        """Convert standard symbol to Kraken pair format (handles both USD and USDT)"""
+        s = symbol.upper().replace('-', '/').strip()
         
-        pair_map = {
-            "BTC": "XBTUSDT",
-            "ETH": "ETHUSDT",
-            "SOL": "SOLUSDT",
-            "XRP": "XRPUSDT"
-        }
+        if '/' in s:
+            base, quote = s.split('/', 1)
+        elif s.endswith('USDT'):
+            base, quote = s[:-4], 'USDT'
+        elif s.endswith('USD'):
+            base, quote = s[:-3], 'USD'
+        else:
+            base, quote = s, 'USDT'
         
-        return pair_map.get(symbol, f"{symbol}USDT")
+        base_map = {'BTC': 'XBT'}
+        base = base_map.get(base, base)
+        
+        return f"{base}{quote}"
     
     async def get_ticker_price(self, pair: str) -> float:
         """Get current price from Kraken public ticker"""
@@ -1009,10 +1014,13 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 prefer_usd = (usdt_balance < 10 and usd_balance >= 10)
                 if prefer_usd:
                     logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
+                else:
+                    logger.info(f"Using USDT pairs: USDT balance ${usdt_balance:.2f}, USD balance ${usd_balance:.2f}")
                 
                 symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
                 kraken_pair = user_state.kraken_client.to_kraken_pair(symbol)
                 
+                logger.info(f"Symbol conversion: alert.symbol={alert.symbol} -> normalized={symbol} -> kraken_pair={kraken_pair}")
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
                 if alert.sell_all or normalized_amount == "all":
