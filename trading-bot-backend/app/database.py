@@ -4,7 +4,7 @@ import shutil
 import logging
 from datetime import datetime
 from typing import Optional, Dict, List, Any
-from sqlalchemy import create_engine, Column, String, Boolean, Float, Text, Integer
+from sqlalchemy import create_engine, Column, String, Boolean, Float, Text, Integer, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -73,6 +73,8 @@ class UserDB(Base):
     
     total_pnl = Column(Float, default=0.0)
     per_coin_pnl = Column(Text, default="{}")
+    
+    last_nonce = Column(BigInteger, default=0)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -185,3 +187,24 @@ def load_all_users_from_db(db: Session) -> Dict[str, Dict[str, Any]]:
             "per_coin_pnl": json.loads(user_db.per_coin_pnl)
         }
     return users_data
+
+def get_and_increment_nonce(db: Session, username: str) -> int:
+    """
+    Get and atomically increment the nonce for a user.
+    Uses microseconds and ensures strictly increasing nonces across restarts.
+    """
+    import time
+    
+    user_db = db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+    
+    if user_db is None:
+        raise Exception(f"User {username} not found")
+    
+    now_us = int(time.time() * 1_000_000)
+    
+    new_nonce = max(now_us, (user_db.last_nonce or 0) + 1)
+    
+    user_db.last_nonce = new_nonce
+    db.commit()
+    
+    return new_nonce
