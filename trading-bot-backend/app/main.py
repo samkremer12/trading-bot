@@ -68,6 +68,9 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "trading-bot-secret-key-change-in-prod
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 30
 
+INSTANCE_ID = str(uuid.uuid4())
+logger.info(f"Application starting with instance_id: {INSTANCE_ID}")
+
 def now_et_iso() -> str:
     """Return current timestamp in America/New_York timezone as ISO string"""
     return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).isoformat()
@@ -190,35 +193,51 @@ async def calculate_fee_aware_buy_volume(kraken_client, pair: str, usd_amount: f
         pair_info = await kraken_client.get_asset_pairs(pair)
         lot_decimals = pair_info['lot_decimals']
         ordermin = pair_info['ordermin']
+        costmin = pair_info.get('costmin')
         quote = pair_info['quote']
+        
+        logger.info(f"Kraken pair info for {pair}: ordermin={ordermin:.8f}, costmin={costmin}, lot_decimals={lot_decimals}, quote={quote}")
         
         fee_rate = await kraken_client.get_fee_rate(pair)
         
         quote_balance_key = kraken_client.to_kraken_balance_key(quote)
         quote_balance = float(balance_data.get(quote_balance_key, 0))
-        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, balance=${quote_balance:.2f}")
         
-        spend_cap = min(usd_amount, quote_balance / (1 + fee_rate))
+        hold_key = f"{quote_balance_key}.HOLD"
+        hold_balance = float(balance_data.get(hold_key, 0))
+        available_balance = quote_balance - hold_balance
+        
+        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, total_balance=${quote_balance:.2f}, hold=${hold_balance:.2f}, available=${available_balance:.2f}")
+        
+        spend_cap = min(usd_amount, available_balance / (1 + fee_rate))
         
         raw_vol = spend_cap / price
         
         step = 10 ** (-lot_decimals)
         vol = math.floor(raw_vol / step) * step
         
+        ordermin_cost_with_fees = ordermin * price * (1 + fee_rate)
+        logger.info(f"Ordermin check: vol={vol:.8f}, ordermin={ordermin:.8f}, ordermin_cost=${ordermin_cost_with_fees:.2f}")
+        
         if vol < ordermin:
-            ordermin_cost_with_fees = ordermin * price * (1 + fee_rate)
-            if ordermin_cost_with_fees <= min(usd_amount, quote_balance):
+            if ordermin_cost_with_fees <= min(usd_amount, available_balance):
                 vol = ordermin
                 logger.info(f"Volume below ordermin, bumping to {ordermin:.8f} (affordable with fees)")
             else:
-                logger.warning(f"Cannot afford ordermin {ordermin:.8f} with fees. Required: ${ordermin_cost_with_fees:.2f}, Available: ${quote_balance:.2f}")
+                logger.warning(f"Cannot afford ordermin {ordermin:.8f} with fees. Required: ${ordermin_cost_with_fees:.2f}, Available: ${available_balance:.2f}, Requested: ${usd_amount:.2f}")
+                return 0.0
+        
+        if costmin and costmin > 0:
+            estimated_cost = vol * price
+            if estimated_cost < costmin:
+                logger.warning(f"Order cost ${estimated_cost:.2f} below costmin ${costmin:.2f}")
                 return 0.0
         
         estimated_cost = vol * price
         est_fees = estimated_cost * fee_rate
         est_total_cost = estimated_cost + est_fees
         
-        logger.info(f"Fee-aware buy calculation: quote={quote}, quote_balance=${quote_balance:.2f}, usd_requested=${usd_amount:.2f}, price=${price:.2f}, fee_rate={fee_rate*100:.3f}%, spend_cap=${spend_cap:.2f}, raw_vol={raw_vol:.8f}, step={step}, vol={vol:.8f}, est_cost=${estimated_cost:.2f}, est_fees=${est_fees:.2f}, est_total=${est_total_cost:.2f}")
+        logger.info(f"Fee-aware buy calculation: quote={quote}, available=${available_balance:.2f}, usd_requested=${usd_amount:.2f}, price=${price:.2f}, fee_rate={fee_rate*100:.3f}%, spend_cap=${spend_cap:.2f}, raw_vol={raw_vol:.8f}, step={step}, vol={vol:.8f}, est_cost=${estimated_cost:.2f}, est_fees=${est_fees:.2f}, est_total=${est_total_cost:.2f}")
         
         return vol
         
@@ -1108,12 +1127,13 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 
                 order = None
                 max_retries = 3
-                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
                 
                 for attempt in range(max_retries):
                     try:
                         if alert.price:
                             price = float(alert.price)
+                            logger.info(f"Placing LIMIT order: pair={kraken_pair}, side={side}, volume={amount:.8f}, price={price}")
                             order_result = await user_state.kraken_client.add_order(
                                 pair=kraken_pair,
                                 side=side,
@@ -1128,6 +1148,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                                 'price': price
                             }
                         else:
+                            logger.info(f"Placing MARKET order: pair={kraken_pair}, side={side}, volume={amount:.8f}")
                             order_result = await user_state.kraken_client.add_order(
                                 pair=kraken_pair,
                                 side=side,
@@ -1142,6 +1163,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                             }
                         break
                     except Exception as e:
+                        logger.error(f"Order placement attempt {attempt + 1} failed: {str(e)}")
                         if attempt == max_retries - 1:
                             raise
                         await asyncio.sleep(1)
@@ -1876,13 +1898,17 @@ async def get_balance_diagnostics(username: str = Depends(verify_session)):
         pair_info_btc = await user_state.kraken_client.get_asset_pairs("XBTUSDT")
         pair_info_eth = await user_state.kraken_client.get_asset_pairs("ETHUSDT")
         
+        all_balances = {key: float(value) for key, value in balance_data.items()}
+        
         return {
             "balance_keys": list(balance_data.keys()),
+            "all_balances": all_balances,
             "balances": {
                 "USDT": float(balance_data.get('USDT', 0)),
                 "ZUSD": float(balance_data.get('ZUSD', 0)),
                 "XXBT": float(balance_data.get('XXBT', 0)),
-                "XETH": float(balance_data.get('XETH', 0))
+                "XETH": float(balance_data.get('XETH', 0)),
+                "USD.HOLD": float(balance_data.get('USD.HOLD', 0))
             },
             "pair_info": {
                 "XBTUSDT": {
