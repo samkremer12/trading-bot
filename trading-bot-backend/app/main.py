@@ -193,35 +193,51 @@ async def calculate_fee_aware_buy_volume(kraken_client, pair: str, usd_amount: f
         pair_info = await kraken_client.get_asset_pairs(pair)
         lot_decimals = pair_info['lot_decimals']
         ordermin = pair_info['ordermin']
+        costmin = pair_info.get('costmin')
         quote = pair_info['quote']
+        
+        logger.info(f"Kraken pair info for {pair}: ordermin={ordermin:.8f}, costmin={costmin}, lot_decimals={lot_decimals}, quote={quote}")
         
         fee_rate = await kraken_client.get_fee_rate(pair)
         
         quote_balance_key = kraken_client.to_kraken_balance_key(quote)
         quote_balance = float(balance_data.get(quote_balance_key, 0))
-        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, balance=${quote_balance:.2f}")
         
-        spend_cap = min(usd_amount, quote_balance / (1 + fee_rate))
+        hold_key = f"{quote_balance_key}.HOLD"
+        hold_balance = float(balance_data.get(hold_key, 0))
+        available_balance = quote_balance - hold_balance
+        
+        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, total_balance=${quote_balance:.2f}, hold=${hold_balance:.2f}, available=${available_balance:.2f}")
+        
+        spend_cap = min(usd_amount, available_balance / (1 + fee_rate))
         
         raw_vol = spend_cap / price
         
         step = 10 ** (-lot_decimals)
         vol = math.floor(raw_vol / step) * step
         
+        ordermin_cost_with_fees = ordermin * price * (1 + fee_rate)
+        logger.info(f"Ordermin check: vol={vol:.8f}, ordermin={ordermin:.8f}, ordermin_cost=${ordermin_cost_with_fees:.2f}")
+        
         if vol < ordermin:
-            ordermin_cost_with_fees = ordermin * price * (1 + fee_rate)
-            if ordermin_cost_with_fees <= min(usd_amount, quote_balance):
+            if ordermin_cost_with_fees <= min(usd_amount, available_balance):
                 vol = ordermin
                 logger.info(f"Volume below ordermin, bumping to {ordermin:.8f} (affordable with fees)")
             else:
-                logger.warning(f"Cannot afford ordermin {ordermin:.8f} with fees. Required: ${ordermin_cost_with_fees:.2f}, Available: ${quote_balance:.2f}")
+                logger.warning(f"Cannot afford ordermin {ordermin:.8f} with fees. Required: ${ordermin_cost_with_fees:.2f}, Available: ${available_balance:.2f}, Requested: ${usd_amount:.2f}")
+                return 0.0
+        
+        if costmin and costmin > 0:
+            estimated_cost = vol * price
+            if estimated_cost < costmin:
+                logger.warning(f"Order cost ${estimated_cost:.2f} below costmin ${costmin:.2f}")
                 return 0.0
         
         estimated_cost = vol * price
         est_fees = estimated_cost * fee_rate
         est_total_cost = estimated_cost + est_fees
         
-        logger.info(f"Fee-aware buy calculation: quote={quote}, quote_balance=${quote_balance:.2f}, usd_requested=${usd_amount:.2f}, price=${price:.2f}, fee_rate={fee_rate*100:.3f}%, spend_cap=${spend_cap:.2f}, raw_vol={raw_vol:.8f}, step={step}, vol={vol:.8f}, est_cost=${estimated_cost:.2f}, est_fees=${est_fees:.2f}, est_total=${est_total_cost:.2f}")
+        logger.info(f"Fee-aware buy calculation: quote={quote}, available=${available_balance:.2f}, usd_requested=${usd_amount:.2f}, price=${price:.2f}, fee_rate={fee_rate*100:.3f}%, spend_cap=${spend_cap:.2f}, raw_vol={raw_vol:.8f}, step={step}, vol={vol:.8f}, est_cost=${estimated_cost:.2f}, est_fees=${est_fees:.2f}, est_total=${est_total_cost:.2f}")
         
         return vol
         
