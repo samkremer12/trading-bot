@@ -1728,16 +1728,38 @@ async def webhook(alert: WebhookAlert):
         
         serializable_results = []
         for r in execution_results:
+            order_data = r.get("order")
+            safe_order = None
+            if order_data:
+                if isinstance(order_data, dict):
+                    safe_order = {
+                        k: v for k, v in order_data.items() 
+                        if isinstance(v, (str, int, float, bool, type(None)))
+                    }
+                else:
+                    safe_order = str(order_data)
+            
+            debug_data = r.get("debug")
+            safe_debug = None
+            if debug_data:
+                if isinstance(debug_data, dict):
+                    safe_debug = {
+                        k: v for k, v in debug_data.items()
+                        if isinstance(v, (str, int, float, bool, type(None)))
+                    }
+                else:
+                    safe_debug = str(debug_data)
+            
             result_dict = {
                 "username": r.get("username"),
                 "timestamp": r.get("timestamp"),
                 "status": r.get("status"),
                 "executed": r.get("executed"),
                 "error": r.get("error"),
-                "order": r.get("order")
+                "order": safe_order
             }
-            if "debug" in r:
-                result_dict["debug"] = r["debug"]
+            if safe_debug:
+                result_dict["debug"] = safe_debug
             serializable_results.append(result_dict)
         
         result = {
