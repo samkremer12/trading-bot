@@ -373,7 +373,7 @@ class KrakenClient:
         """Get account balance"""
         return await self._private_request('Balance')
     
-    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None, validate: bool = False) -> Dict[str, Any]:
         """Place an order on Kraken"""
         data = {
             'pair': pair,
@@ -384,6 +384,9 @@ class KrakenClient:
         
         if price and order_type == 'limit':
             data['price'] = str(price)
+        
+        if validate:
+            data['validate'] = 'true'
         
         return await self._private_request('AddOrder', data)
     
