@@ -1711,14 +1711,17 @@ async def webhook(alert: WebhookAlert):
         
         serializable_results = []
         for r in execution_results:
-            serializable_results.append({
+            result_dict = {
                 "username": r.get("username"),
                 "timestamp": r.get("timestamp"),
                 "status": r.get("status"),
                 "executed": r.get("executed"),
                 "error": r.get("error"),
                 "order": r.get("order")
-            })
+            }
+            if "debug" in r:
+                result_dict["debug"] = r["debug"]
+            serializable_results.append(result_dict)
         
         result = {
             "success": True,
