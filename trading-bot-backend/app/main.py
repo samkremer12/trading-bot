@@ -1643,13 +1643,28 @@ async def webhook(alert: WebhookAlert):
         
         execution_results = await asyncio.gather(*tasks, return_exceptions=False)
         
+        alert_payload = {
+            "action": alert.action,
+            "symbol": alert.symbol,
+            "price": alert.price,
+            "stop_loss": alert.stop_loss,
+            "take_profit": alert.take_profit,
+            "amount": str(alert.amount) if alert.amount else None,
+            "quantity": str(alert.quantity) if alert.quantity else None,
+            "quantity_usd": alert.quantity_usd,
+            "usd_amount": alert.usd_amount,
+            "usd": alert.usd,
+            "sell_all": alert.sell_all,
+            "timestamp": alert.timestamp
+        }
+        
         for result in execution_results:
             username = result.get("username")
             user_state = users[username].state
             
             webhook_log = {
                 "timestamp": result.get("timestamp"),
-                "payload": alert.dict(),
+                "payload": alert_payload,
                 "status": result.get("status"),
                 "executed": result.get("executed"),
                 "error": result.get("error"),
@@ -1660,7 +1675,7 @@ async def webhook(alert: WebhookAlert):
             if result.get("executed"):
                 user_state.last_webhook = {
                     "timestamp": now_et_iso(),
-                    "payload": alert.dict()
+                    "payload": alert_payload
                 }
         
         save_users()
@@ -1671,11 +1686,22 @@ async def webhook(alert: WebhookAlert):
         
         logger.info(f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed")
         
+        serializable_results = []
+        for r in execution_results:
+            serializable_results.append({
+                "username": r.get("username"),
+                "timestamp": r.get("timestamp"),
+                "status": r.get("status"),
+                "executed": r.get("executed"),
+                "error": r.get("error"),
+                "order": r.get("order")
+            })
+        
         result = {
             "success": True,
             "message": f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed",
             "executed": executed_count > 0,
-            "results": execution_results
+            "results": serializable_results
         }
         
         if alert.idempotency_key:
