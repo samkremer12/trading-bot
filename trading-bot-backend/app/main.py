@@ -373,7 +373,7 @@ class KrakenClient:
         """Get account balance"""
         return await self._private_request('Balance')
     
-    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def add_order(self, pair: str, side: str, order_type: str, volume: float, price: Optional[float] = None, validate: bool = False) -> Dict[str, Any]:
         """Place an order on Kraken"""
         data = {
             'pair': pair,
@@ -384,6 +384,9 @@ class KrakenClient:
         
         if price and order_type == 'limit':
             data['price'] = str(price)
+        
+        if validate:
+            data['validate'] = 'true'
         
         return await self._private_request('AddOrder', data)
     
@@ -1035,6 +1038,20 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             amount = 0.001  # default
             
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
+                try:
+                    open_orders_data = await user_state.kraken_client.get_open_orders()
+                    open_orders = open_orders_data.get('open', {})
+                    if open_orders:
+                        logger.info(f"Found {len(open_orders)} open orders, canceling to free held funds")
+                        for order_id in open_orders.keys():
+                            try:
+                                await user_state.kraken_client.cancel_order(order_id)
+                                logger.info(f"Canceled order {order_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to cancel order {order_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error checking/canceling open orders: {e}")
+                
                 balance_data = await user_state.kraken_client.get_balance()
                 usdt_balance = float(balance_data.get('USDT', 0))
                 usd_balance = float(balance_data.get('ZUSD', 0))
@@ -1125,6 +1142,27 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     result["error"] = "Volume below minimum order size"
                     return result
                 
+                pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
+                quote_currency = pair_info.get('quote', 'UNKNOWN')
+                quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
+                quote_balance = float(balance_data.get(quote_balance_key, 0))
+                
+                debug_info = {
+                    "prefer_usd": prefer_usd,
+                    "alert_symbol": alert.symbol,
+                    "normalized_symbol": symbol,
+                    "kraken_pair": kraken_pair,
+                    "quote_currency": quote_currency,
+                    "quote_balance_key": quote_balance_key,
+                    "quote_balance": quote_balance,
+                    "usdt_balance": usdt_balance,
+                    "usd_balance": usd_balance,
+                    "side": side,
+                    "volume": amount,
+                    "price": float(alert.price) if alert.price else None
+                }
+                logger.info(f"DEBUG INFO: {debug_info}")
+                
                 order = None
                 max_retries = 3
                 logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
@@ -1164,6 +1202,8 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                         break
                     except Exception as e:
                         logger.error(f"Order placement attempt {attempt + 1} failed: {str(e)}")
+                        if "Insufficient funds" in str(e):
+                            result["debug"] = debug_info
                         if attempt == max_retries - 1:
                             raise
                         await asyncio.sleep(1)
@@ -1643,13 +1683,28 @@ async def webhook(alert: WebhookAlert):
         
         execution_results = await asyncio.gather(*tasks, return_exceptions=False)
         
+        alert_payload = {
+            "action": alert.action,
+            "symbol": alert.symbol,
+            "price": alert.price,
+            "stop_loss": alert.stop_loss,
+            "take_profit": alert.take_profit,
+            "amount": str(alert.amount) if alert.amount else None,
+            "quantity": str(alert.quantity) if alert.quantity else None,
+            "quantity_usd": alert.quantity_usd,
+            "usd_amount": alert.usd_amount,
+            "usd": alert.usd,
+            "sell_all": alert.sell_all,
+            "timestamp": alert.timestamp
+        }
+        
         for result in execution_results:
             username = result.get("username")
             user_state = users[username].state
             
             webhook_log = {
                 "timestamp": result.get("timestamp"),
-                "payload": alert.dict(),
+                "payload": alert_payload,
                 "status": result.get("status"),
                 "executed": result.get("executed"),
                 "error": result.get("error"),
@@ -1660,7 +1715,7 @@ async def webhook(alert: WebhookAlert):
             if result.get("executed"):
                 user_state.last_webhook = {
                     "timestamp": now_et_iso(),
-                    "payload": alert.dict()
+                    "payload": alert_payload
                 }
         
         save_users()
@@ -1671,11 +1726,47 @@ async def webhook(alert: WebhookAlert):
         
         logger.info(f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed")
         
+        serializable_results = []
+        for r in execution_results:
+            order_data = r.get("order")
+            safe_order = None
+            if order_data:
+                if isinstance(order_data, dict):
+                    safe_order = {
+                        k: v for k, v in order_data.items() 
+                        if isinstance(v, (str, int, float, bool, type(None)))
+                    }
+                else:
+                    safe_order = str(order_data)
+            
+            debug_data = r.get("debug")
+            safe_debug = None
+            if debug_data:
+                if isinstance(debug_data, dict):
+                    safe_debug = {
+                        k: v for k, v in debug_data.items()
+                        if isinstance(v, (str, int, float, bool, type(None)))
+                    }
+                else:
+                    safe_debug = str(debug_data)
+            
+            result_dict = {
+                "username": r.get("username"),
+                "timestamp": r.get("timestamp"),
+                "status": r.get("status"),
+                "executed": r.get("executed"),
+                "error": r.get("error"),
+                "order": safe_order
+            }
+            if safe_debug:
+                result_dict["debug"] = safe_debug
+            serializable_results.append(result_dict)
+        
         result = {
             "success": True,
             "message": f"Webhook broadcast complete: {executed_count} executed, {skipped_count} skipped, {failed_count} failed",
             "executed": executed_count > 0,
-            "results": execution_results
+            "results": serializable_results
         }
         
         if alert.idempotency_key:
@@ -1786,6 +1877,20 @@ async def get_status(username: str = Depends(verify_session)):
         exchange = conn_status["exchange"]
         
         user_state = users[username].state
+        
+        try:
+            db = SessionLocal()
+            try:
+                user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                if user_db:
+                    user_state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
+                    user_state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
+                    user_state.emergency_stop = bool(user_db.emergency_stop)
+                    logger.info(f"Refreshed gate flags from DB for {username}: auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Failed to refresh gate flags from DB for {username}: {e}")
         
         try:
             # Normalize lists to ensure they're valid and contain only dicts
@@ -1979,6 +2084,20 @@ async def monitor_stop_loss():
         try:
             await asyncio.sleep(15)
             
+            try:
+                db = SessionLocal()
+                try:
+                    for username in list(users.keys()):
+                        user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                        if user_db and username in users:
+                            users[username].state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
+                            users[username].state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
+                            users[username].state.emergency_stop = bool(user_db.emergency_stop)
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.warning(f"Failed to refresh gate flags from DB in monitor_stop_loss: {e}")
+            
             for username, user in list(users.items()):
                 try:
                     user_state = user.state
@@ -1989,10 +2108,19 @@ async def monitor_stop_loss():
                     user_state._stoploss_running = True
                     
                     if not user_state.stop_loss_enabled or not user_state.auto_trading_enabled or user_state.emergency_stop:
+                        skip_reason = []
+                        if not user_state.stop_loss_enabled:
+                            skip_reason.append("stop_loss_disabled")
+                        if not user_state.auto_trading_enabled:
+                            skip_reason.append("auto_trading_disabled")
+                        if user_state.emergency_stop:
+                            skip_reason.append("emergency_stop")
+                        logger.debug(f"User {username}: Skipping stop loss check - {', '.join(skip_reason)}")
                         user_state._stoploss_running = False
                         continue
                     
                     if not user_state.open_trades:
+                        logger.debug(f"User {username}: Skipping stop loss check - no open trades")
                         user_state._stoploss_running = False
                         continue
                     
@@ -2004,6 +2132,7 @@ async def monitor_stop_loss():
                                 unique_pairs[pair] = trade
                     
                     if not unique_pairs:
+                        logger.debug(f"User {username}: Skipping stop loss check - no unique buy pairs")
                         user_state._stoploss_running = False
                         continue
                     
