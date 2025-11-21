@@ -769,6 +769,7 @@ class ToggleTradingRequest(BaseModel):
     enabled: bool
 
 class LoginRequest(BaseModel):
+    username: str
     password: str
 
 class UserLoginRequest(BaseModel):
@@ -1292,25 +1293,27 @@ async def register(request: RegisterRequest):
 
 @app.post("/login")
 async def login(request: LoginRequest):
-    """Legacy login endpoint for backward compatibility (password only)"""
-    if verify_password(request.password):
-        admin_username = "admin"
-        if admin_username not in users:
-            password_hash = hash_password_bcrypt(APP_PASSWORD)
-            admin_user = User(admin_username, password_hash)
-            users[admin_username] = admin_user
-            save_users()
-            logger.info(f"Created admin user via legacy login")
-        
-        token = create_jwt_token(admin_username)
-        return {
-            "success": True,
-            "token": token,
-            "username": admin_username,
-            "message": "Login successful"
-        }
-    else:
-        raise HTTPException(status_code=401, detail="Invalid password")
+    """Login with username and password"""
+    username = request.username.strip()
+    password = request.password
+    
+    if username not in users:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    user = users[username]
+    if not verify_password_bcrypt(password, user.password_hash):
+        log_event(user.state, "login", "failed", error="Invalid password")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    token = create_jwt_token(username)
+    log_event(user.state, "login", "success", details={"username": username})
+    
+    return {
+        "success": True,
+        "token": token,
+        "username": username,
+        "message": "Login successful"
+    }
 
 @app.post("/user/login")
 async def user_login(request: UserLoginRequest):
