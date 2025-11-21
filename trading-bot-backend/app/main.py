@@ -1125,6 +1125,27 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     result["error"] = "Volume below minimum order size"
                     return result
                 
+                pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
+                quote_currency = pair_info.get('quote', 'UNKNOWN')
+                quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
+                quote_balance = float(balance_data.get(quote_balance_key, 0))
+                
+                debug_info = {
+                    "prefer_usd": prefer_usd,
+                    "alert_symbol": alert.symbol,
+                    "normalized_symbol": symbol,
+                    "kraken_pair": kraken_pair,
+                    "quote_currency": quote_currency,
+                    "quote_balance_key": quote_balance_key,
+                    "quote_balance": quote_balance,
+                    "usdt_balance": usdt_balance,
+                    "usd_balance": usd_balance,
+                    "side": side,
+                    "volume": amount,
+                    "price": float(alert.price) if alert.price else None
+                }
+                logger.info(f"DEBUG INFO: {debug_info}")
+                
                 order = None
                 max_retries = 3
                 logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
@@ -1164,6 +1185,8 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                         break
                     except Exception as e:
                         logger.error(f"Order placement attempt {attempt + 1} failed: {str(e)}")
+                        if "Insufficient funds" in str(e):
+                            result["debug"] = debug_info
                         if attempt == max_retries - 1:
                             raise
                         await asyncio.sleep(1)
