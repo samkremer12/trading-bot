@@ -68,6 +68,9 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "trading-bot-secret-key-change-in-prod
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 30
 
+INSTANCE_ID = str(uuid.uuid4())
+logger.info(f"Application starting with instance_id: {INSTANCE_ID}")
+
 def now_et_iso() -> str:
     """Return current timestamp in America/New_York timezone as ISO string"""
     return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).isoformat()
@@ -1108,7 +1111,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 
                 order = None
                 max_retries = 3
-                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
                 
                 for attempt in range(max_retries):
                     try:
