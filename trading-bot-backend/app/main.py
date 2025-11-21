@@ -1253,7 +1253,12 @@ async def healthz():
 
 @app.get("/version")
 def version():
-    return {"version": "v1.1.0-json-fix", "commit": "status-json-serialization-fix", "timestamp": "2025-11-20T18:32:00Z"}
+    import subprocess
+    try:
+        commit_sha = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd='/opt/render/project/src').decode().strip()
+    except:
+        commit_sha = "unknown"
+    return {"version": "v1.2.0-auto-migration", "commit": commit_sha, "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 @app.post("/register")
 async def register(request: RegisterRequest):
