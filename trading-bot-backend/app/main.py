@@ -194,7 +194,9 @@ async def calculate_fee_aware_buy_volume(kraken_client, pair: str, usd_amount: f
         
         fee_rate = await kraken_client.get_fee_rate(pair)
         
-        quote_balance = float(balance_data.get(quote, 0))
+        quote_balance_key = kraken_client.to_kraken_balance_key(quote)
+        quote_balance = float(balance_data.get(quote_balance_key, 0))
+        logger.info(f"Balance check: quote={quote}, balance_key={quote_balance_key}, balance=${quote_balance:.2f}")
         
         spend_cap = min(usd_amount, quote_balance / (1 + fee_rate))
         
@@ -290,16 +292,24 @@ async def round_and_enforce_kraken_volume(kraken_client, pair: str, symbol: str,
 class KrakenClient:
     """Direct Kraken API client with proper HMAC-SHA512 authentication"""
     
-    def __init__(self, api_key: str, api_secret: str):
+    def __init__(self, api_key: str, api_secret: str, username: str = None):
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
         self.base_url = "https://api.kraken.com"
-        self.nonce_counter = int(time.time() * 1000)
+        self.username = username
         
     def _get_nonce(self) -> str:
-        """Generate strictly increasing nonce"""
-        self.nonce_counter += 1
-        return str(self.nonce_counter)
+        """Generate strictly increasing nonce using DB-backed persistence"""
+        if self.username:
+            from app.database import SessionLocal, get_and_increment_nonce
+            db = SessionLocal()
+            try:
+                nonce = get_and_increment_nonce(db, self.username)
+                return str(nonce)
+            finally:
+                db.close()
+        else:
+            return str(int(time.time() * 1_000_000))
     
     def _sign_request(self, path: str, data: Dict[str, Any]) -> str:
         """Generate HMAC-SHA512 signature for Kraken API"""
@@ -371,17 +381,22 @@ class KrakenClient:
         return await self._private_request('ClosedOrders')
     
     def to_kraken_pair(self, symbol: str) -> str:
-        """Convert standard symbol to Kraken pair format"""
-        symbol = symbol.upper().replace("USDT", "").replace("USD", "")
+        """Convert standard symbol to Kraken pair format (handles both USD and USDT)"""
+        s = symbol.upper().replace('-', '/').strip()
         
-        pair_map = {
-            "BTC": "XBTUSDT",
-            "ETH": "ETHUSDT",
-            "SOL": "SOLUSDT",
-            "XRP": "XRPUSDT"
-        }
+        if '/' in s:
+            base, quote = s.split('/', 1)
+        elif s.endswith('USDT'):
+            base, quote = s[:-4], 'USDT'
+        elif s.endswith('USD'):
+            base, quote = s[:-3], 'USD'
+        else:
+            base, quote = s, 'USDT'
         
-        return pair_map.get(symbol, f"{symbol}USDT")
+        base_map = {'BTC': 'XBT'}
+        base = base_map.get(base, base)
+        
+        return f"{base}{quote}"
     
     async def get_ticker_price(self, pair: str) -> float:
         """Get current price from Kraken public ticker"""
@@ -635,7 +650,7 @@ async def load_users_and_connect():
                         user_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
                         
                         if user_state.exchange_type == "kraken":
-                            user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                            user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret, username)
                             balance_data = await user_state.kraken_client.get_balance()
                             user_state.api_connected = True
                             user_state.connection_error = None
@@ -693,7 +708,7 @@ async def migrate_legacy_state():
                 admin_state.api_secret = cipher.decrypt(encrypted_secret.encode()).decode()
                 
                 if admin_state.exchange_type == "kraken":
-                    admin_state.kraken_client = KrakenClient(admin_state.api_key, admin_state.api_secret)
+                    admin_state.kraken_client = KrakenClient(admin_state.api_key, admin_state.api_secret, "admin")
                     balance_data = await admin_state.kraken_client.get_balance()
                     admin_state.api_connected = True
                     admin_state.connection_error = None
@@ -797,17 +812,22 @@ def get_exchange_instance(exchange_type: str, api_key: str, api_secret: str):
     
     return exchange
 
-def normalize_symbol(symbol: str, exchange_type: str) -> str:
+def normalize_symbol(symbol: str, exchange_type: str, prefer_usd: bool = False) -> str:
+    """
+    Normalize symbol to exchange format.
+    For Kraken: Can return pairs with /USD or /USDT depending on prefer_usd flag.
+    """
     symbol = symbol.upper().replace("USDT", "").replace("USD", "")
     
     if exchange_type == "kraken":
+        quote = "USD" if prefer_usd else "USDT"
         symbol_map = {
-            "BTC": "XBT/USDT",
-            "ETH": "ETH/USDT",
-            "SOL": "SOL/USDT",
-            "XRP": "XRP/USDT",
+            "BTC": f"XBT/{quote}",
+            "ETH": f"ETH/{quote}",
+            "SOL": f"SOL/{quote}",
+            "XRP": f"XRP/{quote}",
         }
-        return symbol_map.get(symbol, f"{symbol}/USDT")
+        return symbol_map.get(symbol, f"{symbol}/{quote}")
     elif exchange_type == "coinbase":
         return f"{symbol}-USDT"
     else:
@@ -829,39 +849,59 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
     async with user_hydration_locks[username]:
         user_state = users[username].state
         
-        if not user_state.api_key or not user_state.api_secret:
-            logger.info(f"API keys missing in memory for {username}, attempting DB fallback")
-            try:
-                db = SessionLocal()
-                user_db = db.query(UserDB).filter(UserDB.username == username).first()
-                db.close()
-                
-                if user_db and user_db.api_key and user_db.api_secret:
-                    user_state.exchange_type = user_db.exchange_type
+        should_hydrate = (
+            not user_state.api_key or 
+            not user_state.api_secret or 
+            not user_state.exchange_type or
+            (user_state.exchange_type == "kraken" and user_state.kraken_client is None) or
+            (user_state.exchange_type and user_state.exchange_type != "kraken" and user_state.exchange is None)
+        )
+        
+        if should_hydrate:
+            logger.info(f"Hydration needed for {username}: keys_missing={not user_state.api_key or not user_state.api_secret}, exchange_type_missing={not user_state.exchange_type}, client_missing={user_state.kraken_client is None if user_state.exchange_type == 'kraken' else user_state.exchange is None}")
+            
+            if not user_state.api_key or not user_state.api_secret:
+                logger.info(f"Loading API keys from DB for {username}")
+                try:
+                    db = SessionLocal()
+                    user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                    db.close()
                     
-                    if not user_state.exchange_type:
-                        user_state.exchange_type = "kraken"
-                        logger.info(f"Defaulting exchange_type to 'kraken' for {username} (was None in DB)")
-                    
-                    try:
-                        user_state.api_key = cipher.decrypt(user_db.api_key.encode()).decode()
-                        user_state.api_secret = cipher.decrypt(user_db.api_secret.encode()).decode()
-                        logger.info(f"Successfully loaded encrypted API keys from DB for {username}")
-                    except Exception as decrypt_err:
-                        logger.warning(f"Decrypt failed for {username}, treating as plaintext: {decrypt_err}")
-                        user_state.api_key = user_db.api_key
-                        user_state.api_secret = user_db.api_secret
-                        logger.info(f"Successfully loaded plaintext API keys from DB for {username}")
-                else:
-                    logger.info(f"No API keys found in DB for {username}")
+                    if user_db and user_db.api_key and user_db.api_secret:
+                        user_state.exchange_type = user_db.exchange_type
+                        
+                        if not user_state.exchange_type:
+                            user_state.exchange_type = "kraken"
+                            logger.info(f"Defaulting exchange_type to 'kraken' for {username} (was None in DB)")
+                        
+                        try:
+                            user_state.api_key = cipher.decrypt(user_db.api_key.encode()).decode()
+                            user_state.api_secret = cipher.decrypt(user_db.api_secret.encode()).decode()
+                            logger.info(f"Successfully loaded encrypted API keys from DB for {username}")
+                        except Exception as decrypt_err:
+                            logger.warning(f"Decrypt failed for {username}, treating as plaintext: {decrypt_err}")
+                            user_state.api_key = user_db.api_key
+                            user_state.api_secret = user_db.api_secret
+                            logger.info(f"Successfully loaded plaintext API keys from DB for {username}")
+                    else:
+                        logger.info(f"No API keys found in DB for {username}")
+                        user_state.api_connected = False
+                        user_state.connection_error = None
+                        return {"connected": False, "exchange": None, "error": None}
+                except Exception as e:
+                    logger.error(f"Failed to load API keys from DB for {username}: {str(e)}")
                     user_state.api_connected = False
                     user_state.connection_error = None
                     return {"connected": False, "exchange": None, "error": None}
-            except Exception as e:
-                logger.error(f"Failed to load API keys from DB for {username}: {str(e)}")
-                user_state.api_connected = False
-                user_state.connection_error = None
-                return {"connected": False, "exchange": None, "error": None}
+            
+            if not user_state.exchange_type and user_state.api_key and user_state.api_secret:
+                user_state.exchange_type = "kraken"
+                logger.info(f"Defaulting exchange_type to 'kraken' for {username} (keys exist but exchange_type was None)")
+        
+        if not user_state.exchange_type:
+            user_state.api_connected = False
+            user_state.connection_error = "No exchange type configured"
+            return {"connected": False, "exchange": None, "error": "No exchange type configured"}
         
         needs_rebuild = False
         if user_state.exchange_type == "kraken":
@@ -870,17 +910,13 @@ async def ensure_user_exchange_client(username: str, validate: bool = False) -> 
         elif user_state.exchange_type:
             if user_state.exchange is None:
                 needs_rebuild = True
-        else:
-            user_state.api_connected = False
-            user_state.connection_error = "No exchange type configured"
-            return {"connected": False, "exchange": None, "error": "No exchange type configured"}
         
         # Rebuild client if needed
         if needs_rebuild:
             try:
                 logger.info(f"Lazy-hydrating {user_state.exchange_type} client for user {username}")
                 if user_state.exchange_type == "kraken":
-                    user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret)
+                    user_state.kraken_client = KrakenClient(user_state.api_key, user_state.api_secret, username)
                     if validate:
                         await user_state.kraken_client.get_balance()
                     user_state.api_connected = True
@@ -952,7 +988,6 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             return result
         
         async def execute_trade():
-            symbol = normalize_symbol(alert.symbol, user_state.exchange_type)
             action = alert.action.lower()
             
             if action in ["buy", "long"]:
@@ -982,8 +1017,18 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
                 balance_data = await user_state.kraken_client.get_balance()
                 usdt_balance = float(balance_data.get('USDT', 0))
-                kraken_pair = user_state.kraken_client.to_kraken_pair(alert.symbol)
+                usd_balance = float(balance_data.get('ZUSD', 0))
                 
+                prefer_usd = (usdt_balance < 10 and usd_balance >= 10)
+                if prefer_usd:
+                    logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
+                else:
+                    logger.info(f"Using USDT pairs: USDT balance ${usdt_balance:.2f}, USD balance ${usd_balance:.2f}")
+                
+                symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
+                kraken_pair = user_state.kraken_client.to_kraken_pair(symbol)
+                
+                logger.info(f"Symbol conversion: alert.symbol={alert.symbol} -> normalized={symbol} -> kraken_pair={kraken_pair}")
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
                 if alert.sell_all or normalized_amount == "all":
@@ -1310,7 +1355,7 @@ async def save_settings(request: ApiSettingsRequest, username: str = Depends(ver
         
         if exchange == "kraken":
             try:
-                kraken_client = KrakenClient(api_key, api_secret)
+                kraken_client = KrakenClient(api_key, api_secret, username)
                 
                 logger.info(f"Testing Kraken API connection for user {username}...")
                 balance = await kraken_client.get_balance()
