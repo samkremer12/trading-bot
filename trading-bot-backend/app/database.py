@@ -4,9 +4,10 @@ import shutil
 import logging
 from datetime import datetime
 from typing import Optional, Dict, List, Any
-from sqlalchemy import create_engine, Column, String, Boolean, Float, Text, Integer, BigInteger
+from sqlalchemy import create_engine, Column, String, Boolean, Float, Text, Integer, BigInteger, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import ProgrammingError
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +77,45 @@ class UserDB(Base):
     
     last_nonce = Column(BigInteger, default=0)
 
+def ensure_schema():
+    """
+    Ensure database schema is up-to-date by adding missing columns.
+    This runs idempotently on startup to handle schema migrations.
+    """
+    try:
+        dialect_name = engine.dialect.name
+        logger.info(f"Running schema migration check for {dialect_name} database...")
+        
+        with engine.begin() as conn:
+            if dialect_name == 'postgresql':
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_nonce BIGINT DEFAULT 0"
+                ))
+                logger.info("PostgreSQL: Ensured last_nonce column exists")
+            
+            elif dialect_name == 'sqlite':
+                result = conn.execute(text("PRAGMA table_info(users)"))
+                columns = [row[1] for row in result]
+                
+                if 'last_nonce' not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN last_nonce BIGINT DEFAULT 0"
+                    ))
+                    logger.info("SQLite: Added last_nonce column")
+                else:
+                    logger.info("SQLite: last_nonce column already exists")
+            
+            else:
+                logger.warning(f"Unknown dialect {dialect_name}, skipping schema migration")
+        
+        logger.info("Schema migration completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Schema migration failed: {e}")
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
 
 def get_db():
     db = SessionLocal()
@@ -188,23 +226,40 @@ def load_all_users_from_db(db: Session) -> Dict[str, Dict[str, Any]]:
         }
     return users_data
 
-def get_and_increment_nonce(db: Session, username: str) -> int:
+def get_and_increment_nonce(db: Session, username: str, retry_on_schema_error: bool = True) -> int:
     """
     Get and atomically increment the nonce for a user.
     Uses microseconds and ensures strictly increasing nonces across restarts.
+    
+    Self-healing: If the last_nonce column is missing, runs schema migration and retries once.
     """
     import time
     
-    user_db = db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
-    
-    if user_db is None:
-        raise Exception(f"User {username} not found")
-    
-    now_us = int(time.time() * 1_000_000)
-    
-    new_nonce = max(now_us, (user_db.last_nonce or 0) + 1)
-    
-    user_db.last_nonce = new_nonce
-    db.commit()
-    
-    return new_nonce
+    try:
+        user_db = db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+        
+        if user_db is None:
+            raise Exception(f"User {username} not found")
+        
+        now_us = int(time.time() * 1_000_000)
+        
+        new_nonce = max(now_us, (user_db.last_nonce or 0) + 1)
+        
+        user_db.last_nonce = new_nonce
+        db.commit()
+        
+        return new_nonce
+        
+    except ProgrammingError as e:
+        error_str = str(e).lower()
+        if 'last_nonce' in error_str and 'does not exist' in error_str:
+            if retry_on_schema_error:
+                logger.warning(f"last_nonce column missing, running schema migration and retrying...")
+                db.rollback()
+                ensure_schema()
+                return get_and_increment_nonce(db, username, retry_on_schema_error=False)
+            else:
+                logger.error("Schema migration retry failed, column still missing")
+                raise
+        else:
+            raise
