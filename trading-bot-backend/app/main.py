@@ -984,6 +984,17 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
     }
     
     try:
+        db = SessionLocal()
+        try:
+            user_db = db.query(UserDB).filter(UserDB.username == username).first()
+            if user_db:
+                user_state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
+                user_state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
+                user_state.emergency_stop = bool(user_db.emergency_stop)
+                logger.info(f"Webhook for {username}: Refreshed gate flags from DB - auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}")
+        finally:
+            db.close()
+        
         if user_state.emergency_stop:
             result["status"] = "skipped"
             result["error"] = "Emergency stop activated"
@@ -1576,12 +1587,30 @@ async def toggle_trading(request: ToggleTradingRequest, username: str = Depends(
     
     user_state = users[username].state
     user_state.auto_trading_enabled = request.enabled
-    save_users()
-    logger.info(f"User {username}: Auto-trading {'enabled' if request.enabled else 'disabled'}")
-    return {
-        "success": True,
-        "auto_trading_enabled": user_state.auto_trading_enabled
-    }
+    
+    db = SessionLocal()
+    try:
+        user_db = db.query(UserDB).filter(UserDB.username == username).first()
+        if not user_db:
+            raise HTTPException(status_code=404, detail="User not found in database")
+        
+        user_db.auto_trading_enabled = request.enabled
+        db.commit()
+        db.refresh(user_db)
+        
+        persisted_value = bool(user_db.auto_trading_enabled)
+        logger.info(f"User {username}: Auto-trading {'enabled' if persisted_value else 'disabled'} (persisted to DB: {persisted_value})")
+        
+        return {
+            "success": True,
+            "auto_trading_enabled": persisted_value
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to toggle auto-trading for {username}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update auto-trading: {str(e)}")
+    finally:
+        db.close()
 
 @app.post("/toggle-coin")
 async def toggle_coin(request: CoinToggleRequest, username: str = Depends(verify_session)):
