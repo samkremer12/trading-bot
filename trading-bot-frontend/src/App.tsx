@@ -328,10 +328,6 @@ function App() {
       if (response.ok) {
         const data = await response.json()
         setBuyAmount(data.buy_amount_usd)
-        setMessage({ 
-          type: 'success', 
-          text: `Buy amount updated to $${data.buy_amount_usd}` 
-        })
       }
     } catch (error) {
       setMessage({ type: 'error', text: 'Failed to update buy amount' })
@@ -608,45 +604,40 @@ function App() {
                 </div>
               </div>
 
-              <div className="space-y-2">
+              <div className="flex items-center justify-between">
                 <Label className="text-slate-300">Buy Amount per Trade</Label>
-                <div className="p-4 bg-slate-700 rounded-lg space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-white font-medium text-lg">
-                      ${buyAmount.toLocaleString()}
-                    </span>
-                    <span className="text-slate-400 text-sm">
-                      ${buyAmount === 5 ? '5' : buyAmount.toLocaleString()} USD
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min="5"
-                    max="100000"
-                    step="5"
-                    value={buyAmount}
-                    onChange={(e) => {
-                      const newAmount = Number(e.target.value)
-                      setBuyAmount(newAmount)
-                    }}
-                    onMouseUp={(e) => {
-                      const newAmount = Number((e.target as HTMLInputElement).value)
-                      handleUpdateBuyAmount(newAmount)
-                    }}
-                    onTouchEnd={(e) => {
-                      const newAmount = Number((e.target as HTMLInputElement).value)
-                      handleUpdateBuyAmount(newAmount)
-                    }}
-                    disabled={status?.emergency_stop}
-                    className="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer slider"
-                    style={{
-                      background: `linear-gradient(to right, #10b981 0%, #10b981 ${((buyAmount - 5) / (100000 - 5)) * 100}%, #475569 ${((buyAmount - 5) / (100000 - 5)) * 100}%, #475569 100%)`
-                    }}
-                  />
-                  <div className="flex justify-between text-xs text-slate-400">
-                    <span>$5</span>
-                    <span>$100,000</span>
-                  </div>
+                <span className="text-white font-medium">
+                  ${buyAmount.toLocaleString()}
+                </span>
+              </div>
+              <div className="space-y-1">
+                <input
+                  type="range"
+                  min="10"
+                  max="10000"
+                  step="10"
+                  value={buyAmount}
+                  onChange={(e) => {
+                    const newAmount = Number(e.target.value)
+                    setBuyAmount(newAmount)
+                  }}
+                  onMouseUp={(e) => {
+                    const newAmount = Number((e.target as HTMLInputElement).value)
+                    handleUpdateBuyAmount(newAmount)
+                  }}
+                  onTouchEnd={(e) => {
+                    const newAmount = Number((e.target as HTMLInputElement).value)
+                    handleUpdateBuyAmount(newAmount)
+                  }}
+                  disabled={status?.emergency_stop}
+                  className="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer slider"
+                  style={{
+                    background: `linear-gradient(to right, #10b981 0%, #10b981 ${((buyAmount - 10) / (10000 - 10)) * 100}%, #475569 ${((buyAmount - 10) / (10000 - 10)) * 100}%, #475569 100%)`
+                  }}
+                />
+                <div className="flex justify-between text-xs text-slate-400">
+                  <span>$10</span>
+                  <span>$10,000</span>
                 </div>
               </div>
             </CardContent>

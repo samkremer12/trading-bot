@@ -1717,10 +1717,10 @@ async def update_buy_amount(request: BuyAmountRequest, username: str = Depends(v
     if username not in users:
         raise HTTPException(status_code=401, detail="User not found")
     
-    if request.buy_amount_usd < 5 or request.buy_amount_usd > 100000:
+    if request.buy_amount_usd < 10 or request.buy_amount_usd > 10000:
         raise HTTPException(
             status_code=400, 
-            detail="Buy amount must be between $5 and $100,000"
+            detail="Buy amount must be between $10 and $10,000"
         )
     
     user_state = users[username].state
