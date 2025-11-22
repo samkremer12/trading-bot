@@ -61,6 +61,8 @@ class UserDB(Base):
     emergency_stop = Column(Boolean, default=False)
     stop_loss_enabled = Column(Boolean, default=True)
     stop_loss_pct = Column(Float, default=0.02)
+    position_size_pct = Column(Float, default=0.02)
+    buy_amount_usd = Column(Float, default=0.0)
     
     coin_trading_enabled = Column(Text, nullable=False)
     
@@ -92,6 +94,14 @@ def ensure_schema():
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_nonce BIGINT DEFAULT 0"
                 ))
                 logger.info("PostgreSQL: Ensured last_nonce column exists")
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS position_size_pct DOUBLE PRECISION DEFAULT 0.02"
+                ))
+                logger.info("PostgreSQL: Ensured position_size_pct column exists")
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS buy_amount_usd DOUBLE PRECISION DEFAULT 0.0"
+                ))
+                logger.info("PostgreSQL: Ensured buy_amount_usd column exists")
             
             elif dialect_name == 'sqlite':
                 result = conn.execute(text("PRAGMA table_info(users)"))
@@ -104,6 +114,22 @@ def ensure_schema():
                     logger.info("SQLite: Added last_nonce column")
                 else:
                     logger.info("SQLite: last_nonce column already exists")
+                
+                if 'position_size_pct' not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN position_size_pct REAL DEFAULT 0.02"
+                    ))
+                    logger.info("SQLite: Added position_size_pct column")
+                else:
+                    logger.info("SQLite: position_size_pct column already exists")
+                
+                if 'buy_amount_usd' not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN buy_amount_usd REAL DEFAULT 0.0"
+                    ))
+                    logger.info("SQLite: Added buy_amount_usd column")
+                else:
+                    logger.info("SQLite: buy_amount_usd column already exists")
             
             else:
                 logger.warning(f"Unknown dialect {dialect_name}, skipping schema migration")
@@ -148,6 +174,8 @@ def save_user_to_db(db: Session, username: str, user_data: Dict[str, Any]):
     user_db.emergency_stop = user_data.get("emergency_stop", False)
     user_db.stop_loss_enabled = user_data.get("stop_loss_enabled", True)
     user_db.stop_loss_pct = user_data.get("stop_loss_pct", 0.02)
+    user_db.position_size_pct = user_data.get("position_size_pct", 0.02)
+    user_db.buy_amount_usd = user_data.get("buy_amount_usd", 0.0)
     
     user_db.coin_trading_enabled = json.dumps(user_data.get("coin_trading_enabled", {
         "BTC": True, "ETH": True, "SOL": True, "XRP": True
@@ -185,6 +213,8 @@ def load_user_from_db(db: Session, username: str) -> Optional[Dict[str, Any]]:
         "emergency_stop": user_db.emergency_stop,
         "stop_loss_enabled": user_db.stop_loss_enabled,
         "stop_loss_pct": user_db.stop_loss_pct,
+        "position_size_pct": user_db.position_size_pct if hasattr(user_db, 'position_size_pct') else 0.02,
+        "buy_amount_usd": user_db.buy_amount_usd if hasattr(user_db, 'buy_amount_usd') else 0.0,
         "coin_trading_enabled": json.loads(user_db.coin_trading_enabled),
         "last_webhook": json.loads(user_db.last_webhook) if user_db.last_webhook else None,
         "last_order": json.loads(user_db.last_order) if user_db.last_order else None,
@@ -213,6 +243,8 @@ def load_all_users_from_db(db: Session) -> Dict[str, Dict[str, Any]]:
             "emergency_stop": user_db.emergency_stop,
             "stop_loss_enabled": user_db.stop_loss_enabled,
             "stop_loss_pct": user_db.stop_loss_pct,
+            "position_size_pct": user_db.position_size_pct if hasattr(user_db, 'position_size_pct') else 0.02,
+            "buy_amount_usd": user_db.buy_amount_usd if hasattr(user_db, 'buy_amount_usd') else 0.0,
             "coin_trading_enabled": json.loads(user_db.coin_trading_enabled),
             "last_webhook": json.loads(user_db.last_webhook) if user_db.last_webhook else None,
             "last_order": json.loads(user_db.last_order) if user_db.last_order else None,
