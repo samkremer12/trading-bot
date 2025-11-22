@@ -78,6 +78,7 @@ class UserDB(Base):
     per_coin_pnl = Column(Text, default="{}")
     
     last_nonce = Column(BigInteger, default=0)
+    current_state = Column(Text, default="{}")
 
 def ensure_schema():
     """
@@ -102,6 +103,10 @@ def ensure_schema():
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS buy_amount_usd DOUBLE PRECISION DEFAULT 0.0"
                 ))
                 logger.info("PostgreSQL: Ensured buy_amount_usd column exists")
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_state TEXT DEFAULT '{}'"
+                ))
+                logger.info("PostgreSQL: Ensured current_state column exists")
             
             elif dialect_name == 'sqlite':
                 result = conn.execute(text("PRAGMA table_info(users)"))
@@ -130,6 +135,14 @@ def ensure_schema():
                     logger.info("SQLite: Added buy_amount_usd column")
                 else:
                     logger.info("SQLite: buy_amount_usd column already exists")
+                
+                if 'current_state' not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE users ADD COLUMN current_state TEXT DEFAULT '{}'"
+                    ))
+                    logger.info("SQLite: Added current_state column")
+                else:
+                    logger.info("SQLite: current_state column already exists")
             
             else:
                 logger.warning(f"Unknown dialect {dialect_name}, skipping schema migration")
@@ -191,6 +204,7 @@ def save_user_to_db(db: Session, username: str, user_data: Dict[str, Any]):
     
     user_db.total_pnl = user_data.get("total_pnl", 0.0)
     user_db.per_coin_pnl = json.dumps(user_data.get("per_coin_pnl", {}))
+    user_db.current_state = json.dumps(user_data.get("current_state", {}))
     
     db.commit()
     db.refresh(user_db)
@@ -224,7 +238,8 @@ def load_user_from_db(db: Session, username: str) -> Optional[Dict[str, Any]]:
         "webhook_logs": json.loads(user_db.webhook_logs),
         "event_logs": json.loads(user_db.event_logs),
         "total_pnl": user_db.total_pnl,
-        "per_coin_pnl": json.loads(user_db.per_coin_pnl)
+        "per_coin_pnl": json.loads(user_db.per_coin_pnl),
+        "current_state": json.loads(user_db.current_state) if hasattr(user_db, 'current_state') and user_db.current_state else {}
     }
 
 def load_all_users_from_db(db: Session) -> Dict[str, Dict[str, Any]]:
@@ -254,7 +269,8 @@ def load_all_users_from_db(db: Session) -> Dict[str, Dict[str, Any]]:
             "webhook_logs": json.loads(user_db.webhook_logs),
             "event_logs": json.loads(user_db.event_logs),
             "total_pnl": user_db.total_pnl,
-            "per_coin_pnl": json.loads(user_db.per_coin_pnl)
+            "per_coin_pnl": json.loads(user_db.per_coin_pnl),
+            "current_state": json.loads(user_db.current_state) if hasattr(user_db, 'current_state') and user_db.current_state else {}
         }
     return users_data
 

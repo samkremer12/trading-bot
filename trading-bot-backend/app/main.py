@@ -545,6 +545,7 @@ class UserState:
         self.stop_loss_pct: float = 0.02
         self.position_size_pct: float = 0.02
         self.buy_amount_usd: float = 0.0
+        self.current_state: Dict[str, str] = {}
         self._stoploss_running: bool = False
         self.rate_limit_requests: List[float] = []
         self.event_logs: List[Dict] = []
@@ -819,6 +820,10 @@ class PositionSizeRequest(BaseModel):
 class BuyAmountRequest(BaseModel):
     buy_amount_usd: float
 
+class SetStateRequest(BaseModel):
+    coin: str
+    state: str
+
 class ApiSettingsRequest(BaseModel):
     exchange: str
     apiKey: str
@@ -1003,7 +1008,8 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 user_state.emergency_stop = bool(user_db.emergency_stop)
                 user_state.buy_amount_usd = float(user_db.buy_amount_usd or 0)
                 user_state.position_size_pct = float(user_db.position_size_pct or user_state.position_size_pct)
-                logger.info(f"Webhook for {username}: Refreshed from DB - auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}, buy_amount_usd=${user_state.buy_amount_usd:.2f}")
+                user_state.current_state = json.loads(user_db.current_state) if hasattr(user_db, 'current_state') and user_db.current_state else {}
+                logger.info(f"Webhook for {username}: Refreshed from DB - auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}, buy_amount_usd=${user_state.buy_amount_usd:.2f}, current_state={user_state.current_state}")
         finally:
             db.close()
         
@@ -1043,6 +1049,41 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             else:
                 raise ValueError(f"Invalid action: {action}")
             
+            coin = alert.symbol.upper().replace("USDT", "").replace("USD", "")
+            
+            state_db = SessionLocal()
+            try:
+                user_db = state_db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+                if not user_db:
+                    raise Exception(f"User {username} not found in database")
+                
+                current_state = json.loads(user_db.current_state or "{}")
+                coin_state = current_state.get(coin, "OUT")
+                
+                logger.info(f"STATE GATE: coin={coin}, current_state={coin_state}, action={side}")
+                
+                if side == "buy":
+                    if coin_state != "OUT":
+                        result["status"] = "skipped"
+                        result["error"] = f"State is {coin_state}, cannot BUY (must be OUT). Use sell first or reset state."
+                        logger.warning(f"STATE GATE BLOCKED: Attempted BUY when state={coin_state} for {coin}")
+                        return result
+                    current_state[coin] = "BUYING"
+                    logger.info(f"STATE TRANSITION: {coin} OUT -> BUYING")
+                else:  # sell
+                    if coin_state != "IN":
+                        result["status"] = "skipped"
+                        result["error"] = f"State is {coin_state}, cannot SELL (must be IN). Use buy first or reset state."
+                        logger.warning(f"STATE GATE BLOCKED: Attempted SELL when state={coin_state} for {coin}")
+                        return result
+                    current_state[coin] = "SELLING"
+                    logger.info(f"STATE TRANSITION: {coin} IN -> SELLING")
+                
+                user_db.current_state = json.dumps(current_state)
+                state_db.commit()
+            finally:
+                state_db.close()
+            
             normalized_usd_amount = None
             if alert.usd is not None:
                 normalized_usd_amount = float(alert.usd)
@@ -1060,41 +1101,102 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
             
             amount = None
             
-            if user_state.exchange_type == "kraken" and user_state.kraken_client:
-                try:
-                    open_orders_data = await user_state.kraken_client.get_open_orders()
-                    open_orders = open_orders_data.get('open', {})
-                    if open_orders:
-                        logger.info(f"Found {len(open_orders)} open orders, canceling to free held funds")
-                        for order_id in open_orders.keys():
-                            try:
-                                await user_state.kraken_client.cancel_order(order_id)
-                                logger.info(f"Canceled order {order_id}")
-                            except Exception as e:
-                                logger.warning(f"Failed to cancel order {order_id}: {e}")
-                except Exception as e:
-                    logger.warning(f"Error checking/canceling open orders: {e}")
-                
-                balance_data = await user_state.kraken_client.get_balance()
-                usdt_balance = float(balance_data.get('USDT', 0))
-                usd_balance = float(balance_data.get('ZUSD', 0))
-                
-                prefer_usd = (usdt_balance < 10 and usd_balance >= 10)
-                if prefer_usd:
-                    logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
-                else:
-                    logger.info(f"Using USDT pairs: USDT balance ${usdt_balance:.2f}, USD balance ${usd_balance:.2f}")
-                
-                symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
-                kraken_pair = user_state.kraken_client.to_kraken_pair(symbol)
-                
-                logger.info(f"Symbol conversion: alert.symbol={alert.symbol} -> normalized={symbol} -> kraken_pair={kraken_pair}")
-                logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
-                
-                if side == "buy":
-                    if user_state.buy_amount_usd <= 0:
+            try:
+                if user_state.exchange_type == "kraken" and user_state.kraken_client:
+                    try:
+                        open_orders_data = await user_state.kraken_client.get_open_orders()
+                        open_orders = open_orders_data.get('open', {})
+                        if open_orders:
+                            logger.info(f"Found {len(open_orders)} open orders, canceling to free held funds")
+                            for order_id in open_orders.keys():
+                                try:
+                                    await user_state.kraken_client.cancel_order(order_id)
+                                    logger.info(f"Canceled order {order_id}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel order {order_id}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Error checking/canceling open orders: {e}")
+                    
+                    balance_data = await user_state.kraken_client.get_balance()
+                    usdt_balance = float(balance_data.get('USDT', 0))
+                    usd_balance = float(balance_data.get('ZUSD', 0))
+                    
+                    prefer_usd = (usdt_balance < 10 and usd_balance >= 10)
+                    if prefer_usd:
+                        logger.info(f"Auto-switching to USD pairs: USDT balance ${usdt_balance:.2f} < $10, USD balance ${usd_balance:.2f} >= $10")
+                    else:
+                        logger.info(f"Using USDT pairs: USDT balance ${usdt_balance:.2f}, USD balance ${usd_balance:.2f}")
+                    
+                    symbol = normalize_symbol(alert.symbol, user_state.exchange_type, prefer_usd=prefer_usd)
+                    kraken_pair = user_state.kraken_client.to_kraken_pair(symbol)
+                    
+                    logger.info(f"Symbol conversion: alert.symbol={alert.symbol} -> normalized={symbol} -> kraken_pair={kraken_pair}")
+                    logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
+                    
+                    if side == "buy":
+                        if user_state.buy_amount_usd <= 0:
+                            result["status"] = "skipped"
+                            result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
+                            return result
+                        
+                        pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
+                        quote_currency = pair_info.get('quote', 'UNKNOWN')
+                        quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
+                        quote_balance = float(balance_data.get(quote_balance_key, 0))
+                        
+                        usd_to_spend = min(user_state.buy_amount_usd, quote_balance)
+                        
+                        if usd_to_spend < 10:
+                            result["status"] = "skipped"
+                            result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${quote_balance:.2f}, minimum $10"
+                            return result
+                        
+                        if alert.price:
+                            price_used = float(alert.price)
+                        else:
+                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                        
+                        logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
+                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, usd_to_spend, price_used, balance_data)
+                    
+                    else:
+                        if alert.sell_all or normalized_amount == "all":
+                            coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
+                            coin_balance = float(balance_data.get(coin_key, 0))
+                            logger.info(f"SELL ALL: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                            amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
+                        elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                            coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
+                            coin_balance = float(balance_data.get(coin_key, 0))
+                            logger.info(f"SELL ALL (quantity): coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                            amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
+                        elif normalized_usd_amount:
+                            if alert.price:
+                                price_used = float(alert.price)
+                                raw_amount = normalized_usd_amount / price_used
+                                logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
+                            else:
+                                current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                                raw_amount = normalized_usd_amount / current_price
+                                logger.info(f"SELL USD: ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                            amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        elif normalized_amount and normalized_amount != "all":
+                            raw_amount = float(normalized_amount)
+                            logger.info(f"SELL AMOUNT: {raw_amount:.8f} {coin}")
+                            amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        elif alert.quantity:
+                            raw_amount = float(alert.quantity)
+                            logger.info(f"SELL QUANTITY: {raw_amount:.8f} {coin}")
+                            amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        else:
+                            result["status"] = "skipped"
+                            result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
+                            return result
+                    
+                    if amount == 0:
+                        logger.warning(f"Skipping order: volume is 0 (likely dust balance below ordermin)")
                         result["status"] = "skipped"
-                        result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
+                        result["error"] = "Volume below minimum order size"
                         return result
                     
                     pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
@@ -1102,226 +1204,199 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
                     quote_balance = float(balance_data.get(quote_balance_key, 0))
                     
-                    usd_to_spend = min(user_state.buy_amount_usd, quote_balance)
+                    debug_info = {
+                        "prefer_usd": prefer_usd,
+                        "alert_symbol": alert.symbol,
+                        "normalized_symbol": symbol,
+                        "kraken_pair": kraken_pair,
+                        "quote_currency": quote_currency,
+                        "quote_balance_key": quote_balance_key,
+                        "quote_balance": quote_balance,
+                        "usdt_balance": usdt_balance,
+                        "usd_balance": usd_balance,
+                        "side": side,
+                        "volume": amount,
+                        "price": float(alert.price) if alert.price else None
+                    }
+                    logger.info(f"DEBUG INFO: {debug_info}")
                     
-                    if usd_to_spend < 10:
-                        result["status"] = "skipped"
-                        result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${quote_balance:.2f}, minimum $10"
-                        return result
+                    order = None
+                    max_retries = 3
+                    logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
                     
-                    if alert.price:
-                        price_used = float(alert.price)
-                    else:
-                        price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                    for attempt in range(max_retries):
+                        try:
+                            if alert.price:
+                                price = float(alert.price)
+                                logger.info(f"Placing LIMIT order: pair={kraken_pair}, side={side}, volume={amount:.8f}, price={price}")
+                                order_result = await user_state.kraken_client.add_order(
+                                    pair=kraken_pair,
+                                    side=side,
+                                    order_type='limit',
+                                    volume=amount,
+                                    price=price
+                                )
+                                order = {
+                                    'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
+                                    'status': 'open',
+                                    'average': price,
+                                    'price': price
+                                }
+                            else:
+                                logger.info(f"Placing MARKET order: pair={kraken_pair}, side={side}, volume={amount:.8f}")
+                                order_result = await user_state.kraken_client.add_order(
+                                    pair=kraken_pair,
+                                    side=side,
+                                    order_type='market',
+                                    volume=amount
+                                )
+                                order = {
+                                    'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
+                                    'status': 'open',
+                                    'average': 0,
+                                    'price': 0
+                                }
+                            break
+                        except Exception as e:
+                            logger.error(f"Order placement attempt {attempt + 1} failed: {str(e)}")
+                            if "Insufficient funds" in str(e):
+                                result["debug"] = debug_info
+                            if attempt == max_retries - 1:
+                                raise
+                            await asyncio.sleep(1)
                     
-                    logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
-                    amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, usd_to_spend, price_used, balance_data)
-                
+                    exchange_pair = kraken_pair
                 else:
-                    if alert.sell_all or normalized_amount == "all":
-                        coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
-                        coin_balance = float(balance_data.get(coin_key, 0))
-                        logger.info(f"SELL ALL: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                    elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                        coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
-                        coin_balance = float(balance_data.get(coin_key, 0))
-                        logger.info(f"SELL ALL (quantity): coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                    elif normalized_usd_amount:
-                        if alert.price:
-                            price_used = float(alert.price)
-                            raw_amount = normalized_usd_amount / price_used
-                            logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
-                        else:
-                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = normalized_usd_amount / current_price
-                            logger.info(f"SELL USD: ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                    elif normalized_amount and normalized_amount != "all":
-                        raw_amount = float(normalized_amount)
-                        logger.info(f"SELL AMOUNT: {raw_amount:.8f} {coin}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                    elif alert.quantity:
-                        raw_amount = float(alert.quantity)
-                        logger.info(f"SELL QUANTITY: {raw_amount:.8f} {coin}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                    else:
-                        result["status"] = "skipped"
-                        result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
-                        return result
-                
-                if amount == 0:
-                    logger.warning(f"Skipping order: volume is 0 (likely dust balance below ordermin)")
-                    result["status"] = "skipped"
-                    result["error"] = "Volume below minimum order size"
-                    return result
-                
-                pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
-                quote_currency = pair_info.get('quote', 'UNKNOWN')
-                quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
-                quote_balance = float(balance_data.get(quote_balance_key, 0))
-                
-                debug_info = {
-                    "prefer_usd": prefer_usd,
-                    "alert_symbol": alert.symbol,
-                    "normalized_symbol": symbol,
-                    "kraken_pair": kraken_pair,
-                    "quote_currency": quote_currency,
-                    "quote_balance_key": quote_balance_key,
-                    "quote_balance": quote_balance,
-                    "usdt_balance": usdt_balance,
-                    "usd_balance": usd_balance,
-                    "side": side,
-                    "volume": amount,
-                    "price": float(alert.price) if alert.price else None
-                }
-                logger.info(f"DEBUG INFO: {debug_info}")
-                
-                order = None
-                max_retries = 3
-                logger.info(f"Using kraken_pair={kraken_pair} for order (already calculated with prefer_usd logic)")
-                
-                for attempt in range(max_retries):
-                    try:
-                        if alert.price:
-                            price = float(alert.price)
-                            logger.info(f"Placing LIMIT order: pair={kraken_pair}, side={side}, volume={amount:.8f}, price={price}")
-                            order_result = await user_state.kraken_client.add_order(
-                                pair=kraken_pair,
-                                side=side,
-                                order_type='limit',
-                                volume=amount,
-                                price=price
-                            )
-                            order = {
-                                'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
-                                'status': 'open',
-                                'average': price,
-                                'price': price
-                            }
-                        else:
-                            logger.info(f"Placing MARKET order: pair={kraken_pair}, side={side}, volume={amount:.8f}")
-                            order_result = await user_state.kraken_client.add_order(
-                                pair=kraken_pair,
-                                side=side,
-                                order_type='market',
-                                volume=amount
-                            )
-                            order = {
-                                'id': order_result.get('txid', [''])[0] if order_result.get('txid') else '',
-                                'status': 'open',
-                                'average': 0,
-                                'price': 0
-                            }
-                        break
-                    except Exception as e:
-                        logger.error(f"Order placement attempt {attempt + 1} failed: {str(e)}")
-                        if "Insufficient funds" in str(e):
-                            result["debug"] = debug_info
-                        if attempt == max_retries - 1:
-                            raise
-                        await asyncio.sleep(1)
-                
-                exchange_pair = kraken_pair
-            else:
-                balance = user_state.exchange.fetch_balance()
-                usdt_balance = balance.get('USDT', {}).get('free', 0)
-                
-                if side == "buy":
-                    if user_state.buy_amount_usd <= 0:
-                        result["status"] = "skipped"
-                        result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
-                        return result
+                    balance = user_state.exchange.fetch_balance()
+                    usdt_balance = balance.get('USDT', {}).get('free', 0)
                     
-                    usd_to_spend = min(user_state.buy_amount_usd, usdt_balance)
-                    
-                    if usd_to_spend < 10:
-                        result["status"] = "skipped"
-                        result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${usdt_balance:.2f}, minimum $10"
-                        return result
-                    
-                    if alert.price:
-                        price_used = float(alert.price)
-                    else:
-                        ticker = user_state.exchange.fetch_ticker(symbol)
-                        price_used = ticker['last']
-                    
-                    logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
-                    amount = usd_to_spend / price_used
-                
-                else:
-                    if alert.sell_all:
-                        coin_balance = balance.get(coin, {}).get('free', 0)
-                        logger.info(f"SELL ALL: coin={coin}, balance={coin_balance:.8f}")
-                        amount = coin_balance
-                    elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                        coin_balance = balance.get(coin, {}).get('free', 0)
-                        logger.info(f"SELL ALL (quantity): coin={coin}, balance={coin_balance:.8f}")
-                        amount = coin_balance
-                    elif normalized_usd_amount:
+                    if side == "buy":
+                        if user_state.buy_amount_usd <= 0:
+                            result["status"] = "skipped"
+                            result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
+                            return result
+                        
+                        usd_to_spend = min(user_state.buy_amount_usd, usdt_balance)
+                        
+                        if usd_to_spend < 10:
+                            result["status"] = "skipped"
+                            result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${usdt_balance:.2f}, minimum $10"
+                            return result
+                        
                         if alert.price:
                             price_used = float(alert.price)
                         else:
                             ticker = user_state.exchange.fetch_ticker(symbol)
                             price_used = ticker['last']
-                        amount = normalized_usd_amount / price_used
-                        logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {amount:.8f} {coin}")
-                    elif normalized_amount and normalized_amount != "all":
-                        amount = float(normalized_amount)
-                        logger.info(f"SELL AMOUNT: {amount:.8f} {coin}")
-                    elif alert.quantity:
-                        amount = float(alert.quantity)
-                        logger.info(f"SELL QUANTITY: {amount:.8f} {coin}")
+                        
+                        logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
+                        amount = usd_to_spend / price_used
+                    
                     else:
-                        result["status"] = "skipped"
-                        result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
-                        return result
-                
-                order = None
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        if alert.price:
-                            price = float(alert.price)
-                            order = user_state.exchange.create_limit_order(symbol, side, amount, price)
+                        if alert.sell_all:
+                            coin_balance = balance.get(coin, {}).get('free', 0)
+                            logger.info(f"SELL ALL: coin={coin}, balance={coin_balance:.8f}")
+                            amount = coin_balance
+                        elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                            coin_balance = balance.get(coin, {}).get('free', 0)
+                            logger.info(f"SELL ALL (quantity): coin={coin}, balance={coin_balance:.8f}")
+                            amount = coin_balance
+                        elif normalized_usd_amount:
+                            if alert.price:
+                                price_used = float(alert.price)
+                            else:
+                                ticker = user_state.exchange.fetch_ticker(symbol)
+                                price_used = ticker['last']
+                            amount = normalized_usd_amount / price_used
+                            logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {amount:.8f} {coin}")
+                        elif normalized_amount and normalized_amount != "all":
+                            amount = float(normalized_amount)
+                            logger.info(f"SELL AMOUNT: {amount:.8f} {coin}")
+                        elif alert.quantity:
+                            amount = float(alert.quantity)
+                            logger.info(f"SELL QUANTITY: {amount:.8f} {coin}")
                         else:
-                            order = user_state.exchange.create_market_order(symbol, side, amount)
-                        break
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            raise
-                        await asyncio.sleep(1)
+                            result["status"] = "skipped"
+                            result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
+                            return result
+                    
+                    order = None
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if alert.price:
+                                price = float(alert.price)
+                                order = user_state.exchange.create_limit_order(symbol, side, amount, price)
+                            else:
+                                order = user_state.exchange.create_market_order(symbol, side, amount)
+                            break
+                        except Exception as e:
+                            if attempt == max_retries - 1:
+                                raise
+                            await asyncio.sleep(1)
+                    
+                    exchange_pair = symbol
+            
+                entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
                 
-                exchange_pair = symbol
-            
-            entry_price = float(alert.price) if alert.price else order.get('average', order.get('price', 0))
-            
-            trade = {
-                "timestamp": now_et_iso(),
-                "symbol": symbol,
-                "coin": coin,
-                "side": side,
-                "amount": amount,
-                "entry_price": entry_price,
-                "order_id": order.get('id'),
-                "status": order.get('status'),
-                "stop_loss": alert.stop_loss,
-                "take_profit": alert.take_profit,
-                "pnl": 0.0,
-                "raw_symbol": alert.symbol,
-                "exchange_pair": exchange_pair
-            }
-            
-            user_state.last_order = trade
-            user_state.orders_history.append(trade)
-            
-            if side == "buy":
-                user_state.open_trades.append(trade)
-            else:
-                user_state.closed_trades.append(trade)
-            
-            return trade
+                trade = {
+                    "timestamp": now_et_iso(),
+                    "symbol": symbol,
+                    "coin": coin,
+                    "side": side,
+                    "amount": amount,
+                    "entry_price": entry_price,
+                    "order_id": order.get('id'),
+                    "status": order.get('status'),
+                    "stop_loss": alert.stop_loss,
+                    "take_profit": alert.take_profit,
+                    "pnl": 0.0,
+                    "raw_symbol": alert.symbol,
+                    "exchange_pair": exchange_pair
+                }
+                
+                user_state.last_order = trade
+                user_state.orders_history.append(trade)
+                
+                if side == "buy":
+                    user_state.open_trades.append(trade)
+                else:
+                    user_state.closed_trades.append(trade)
+                
+                    finalize_db = SessionLocal()
+                    try:
+                        finalize_user_db = finalize_db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+                        if finalize_user_db:
+                            finalize_state = json.loads(finalize_user_db.current_state or "{}")
+                            if side == "buy":
+                                finalize_state[coin] = "IN"
+                                logger.info(f"STATE FINALIZE: {coin} BUYING -> IN (order placed successfully)")
+                            else:
+                                finalize_state[coin] = "OUT"
+                                logger.info(f"STATE FINALIZE: {coin} SELLING -> OUT (order placed successfully)")
+                            finalize_user_db.current_state = json.dumps(finalize_state)
+                            finalize_db.commit()
+                    finally:
+                        finalize_db.close()
+                    
+                    return trade
+            except Exception as order_error:
+                revert_db = SessionLocal()
+                try:
+                    revert_user_db = revert_db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+                    if revert_user_db:
+                        revert_state = json.loads(revert_user_db.current_state or "{}")
+                        if side == "buy":
+                            revert_state[coin] = "OUT"
+                            logger.warning(f"STATE REVERT: {coin} BUYING -> OUT (order failed: {order_error})")
+                        else:
+                            revert_state[coin] = "IN"
+                            logger.warning(f"STATE REVERT: {coin} SELLING -> IN (order failed: {order_error})")
+                        revert_user_db.current_state = json.dumps(revert_state)
+                    revert_db.commit()
+                finally:
+                    revert_db.close()
+                    raise
         
         trade = await asyncio.wait_for(execute_trade(), timeout=timeout_seconds)
         
@@ -1751,6 +1826,49 @@ async def update_buy_amount(request: BuyAmountRequest, username: str = Depends(v
     finally:
         db.close()
 
+@app.post("/set-state")
+async def set_state(request: SetStateRequest, username: str = Depends(verify_session)):
+    """Manually reset the state for a specific coin"""
+    if username not in users:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    coin = request.coin.upper()
+    state = request.state.upper()
+    
+    if state not in ["IN", "OUT"]:
+        raise HTTPException(status_code=400, detail="State must be 'IN' or 'OUT'")
+    
+    user_state = users[username].state
+    
+    db = SessionLocal()
+    try:
+        user_db = db.query(UserDB).filter(UserDB.username == username).with_for_update().first()
+        if not user_db:
+            raise HTTPException(status_code=404, detail="User not found in database")
+        
+        current_state = json.loads(user_db.current_state or "{}")
+        old_state = current_state.get(coin, "OUT")
+        current_state[coin] = state
+        user_db.current_state = json.dumps(current_state)
+        db.commit()
+        
+        user_state.current_state = current_state
+        
+        logger.info(f"User {username}: Manually reset state for {coin} from {old_state} to {state}")
+        
+        return {
+            "success": True,
+            "coin": coin,
+            "old_state": old_state,
+            "new_state": state
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to reset state for {username}/{coin}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset state: {str(e)}")
+    finally:
+        db.close()
+
 @app.post("/webhook")
 async def webhook(alert: WebhookAlert):
     """
@@ -2074,6 +2192,7 @@ async def get_status(username: str = Depends(verify_session)):
             "position_size_pct": float(user_state.position_size_pct) if user_state.position_size_pct is not None else 0.02,
             "buy_amount_usd": float(user_state.buy_amount_usd) if user_state.buy_amount_usd is not None else 0.0,
             "coin_trading_enabled": user_state.coin_trading_enabled if user_state.coin_trading_enabled else {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
+            "current_state": user_state.current_state if user_state.current_state else {},
             "last_webhook": user_state.last_webhook,
             "last_order": user_state.last_order,
             "pnl_summary": pnl_summary,
