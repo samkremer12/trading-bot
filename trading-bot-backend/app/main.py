@@ -1908,6 +1908,20 @@ async def get_status(username: str = Depends(verify_session)):
         user_state = users[username].state
         
         try:
+            db = SessionLocal()
+            try:
+                user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                if user_db:
+                    user_state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
+                    user_state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
+                    user_state.emergency_stop = bool(user_db.emergency_stop)
+                    logger.info(f"Refreshed gate flags from DB for {username}: auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Failed to refresh gate flags from DB for {username}: {e}")
+        
+        try:
             # Normalize lists to ensure they're valid and contain only dicts
             closed_trades = [t for t in (user_state.closed_trades or []) if isinstance(t, dict)]
             orders_history = [o for o in (user_state.orders_history or []) if isinstance(o, dict)]
@@ -2099,6 +2113,20 @@ async def monitor_stop_loss():
         try:
             await asyncio.sleep(15)
             
+            try:
+                db = SessionLocal()
+                try:
+                    for username in list(users.keys()):
+                        user_db = db.query(UserDB).filter(UserDB.username == username).first()
+                        if user_db and username in users:
+                            users[username].state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
+                            users[username].state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
+                            users[username].state.emergency_stop = bool(user_db.emergency_stop)
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.warning(f"Failed to refresh gate flags from DB in monitor_stop_loss: {e}")
+            
             for username, user in list(users.items()):
                 try:
                     user_state = user.state
@@ -2109,10 +2137,19 @@ async def monitor_stop_loss():
                     user_state._stoploss_running = True
                     
                     if not user_state.stop_loss_enabled or not user_state.auto_trading_enabled or user_state.emergency_stop:
+                        skip_reason = []
+                        if not user_state.stop_loss_enabled:
+                            skip_reason.append("stop_loss_disabled")
+                        if not user_state.auto_trading_enabled:
+                            skip_reason.append("auto_trading_disabled")
+                        if user_state.emergency_stop:
+                            skip_reason.append("emergency_stop")
+                        logger.debug(f"User {username}: Skipping stop loss check - {', '.join(skip_reason)}")
                         user_state._stoploss_running = False
                         continue
                     
                     if not user_state.open_trades:
+                        logger.debug(f"User {username}: Skipping stop loss check - no open trades")
                         user_state._stoploss_running = False
                         continue
                     
@@ -2124,6 +2161,7 @@ async def monitor_stop_loss():
                                 unique_pairs[pair] = trade
                     
                     if not unique_pairs:
+                        logger.debug(f"User {username}: Skipping stop loss check - no unique buy pairs")
                         user_state._stoploss_running = False
                         continue
                     
