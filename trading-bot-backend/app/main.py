@@ -543,6 +543,8 @@ class UserState:
         self.emergency_stop: bool = False
         self.stop_loss_enabled: bool = True
         self.stop_loss_pct: float = 0.02
+        self.position_size_pct: float = 0.02
+        self.buy_amount_usd: float = 0.0
         self._stoploss_running: bool = False
         self.rate_limit_requests: List[float] = []
         self.event_logs: List[Dict] = []
@@ -652,6 +654,8 @@ async def load_users_and_connect():
                 user_state.emergency_stop = data.get("emergency_stop", False)
                 user_state.stop_loss_enabled = data.get("stop_loss_enabled", True)
                 user_state.stop_loss_pct = data.get("stop_loss_pct", 0.02)
+                user_state.position_size_pct = data.get("position_size_pct", 0.02)
+                user_state.buy_amount_usd = data.get("buy_amount_usd", 0.0)
                 
                 user_state.last_webhook = data.get("last_webhook")
                 user_state.last_order = data.get("last_order")
@@ -808,6 +812,12 @@ class CoinToggleRequest(BaseModel):
 
 class EmergencyStopRequest(BaseModel):
     stop: bool
+
+class PositionSizeRequest(BaseModel):
+    position_size_pct: float
+
+class BuyAmountRequest(BaseModel):
+    buy_amount_usd: float
 
 class ApiSettingsRequest(BaseModel):
     exchange: str
@@ -1130,7 +1140,12 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                     raw_amount = float(alert.quantity)
                     amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
                 elif usdt_balance > 0:
-                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
+                    if user_state.buy_amount_usd > 0:
+                        position_size_usdt = user_state.buy_amount_usd
+                        logger.info(f"Using fixed buy amount: ${position_size_usdt:.2f}")
+                    else:
+                        position_size_usdt = calculate_position_size(usdt_balance, user_state.position_size_pct)
+                        logger.info(f"Using percentage-based sizing: {user_state.position_size_pct * 100:.1f}% of ${usdt_balance:.2f} = ${position_size_usdt:.2f}")
                     if side == "buy":
                         if alert.price:
                             price_used = float(alert.price)
@@ -1247,7 +1262,12 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 elif alert.quantity:
                     amount = float(alert.quantity)
                 elif usdt_balance > 0:
-                    position_size_usdt = calculate_position_size(usdt_balance, 0.02)
+                    if user_state.buy_amount_usd > 0:
+                        position_size_usdt = user_state.buy_amount_usd
+                        logger.info(f"Using fixed buy amount: ${position_size_usdt:.2f}")
+                    else:
+                        position_size_usdt = calculate_position_size(usdt_balance, user_state.position_size_pct)
+                        logger.info(f"Using percentage-based sizing: {user_state.position_size_pct * 100:.1f}% of ${usdt_balance:.2f} = ${position_size_usdt:.2f}")
                     if alert.price:
                         amount = position_size_usdt / float(alert.price)
                     else:
@@ -1652,6 +1672,84 @@ async def emergency_stop(request: EmergencyStopRequest, username: str = Depends(
         "auto_trading_enabled": user_state.auto_trading_enabled
     }
 
+@app.post("/update-position-size")
+async def update_position_size(request: PositionSizeRequest, username: str = Depends(verify_session)):
+    """Update position size percentage with validation"""
+    if username not in users:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    if request.position_size_pct < 0.005 or request.position_size_pct > 1.0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Position size must be between 0.5% (0.005) and 100% (1.0)"
+        )
+    
+    user_state = users[username].state
+    user_state.position_size_pct = request.position_size_pct
+    
+    db = SessionLocal()
+    try:
+        user_db = db.query(UserDB).filter(UserDB.username == username).first()
+        if not user_db:
+            raise HTTPException(status_code=404, detail="User not found in database")
+        
+        user_db.position_size_pct = request.position_size_pct
+        db.commit()
+        db.refresh(user_db)
+        
+        persisted_value = float(user_db.position_size_pct)
+        logger.info(f"User {username}: Position size updated to {persisted_value * 100:.1f}% (persisted to DB: {persisted_value})")
+        
+        return {
+            "success": True,
+            "position_size_pct": persisted_value
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update position size for {username}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update position size: {str(e)}")
+    finally:
+        db.close()
+
+@app.post("/update-buy-amount")
+async def update_buy_amount(request: BuyAmountRequest, username: str = Depends(verify_session)):
+    """Update buy amount in USD with validation"""
+    if username not in users:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    if request.buy_amount_usd < 5 or request.buy_amount_usd > 100000:
+        raise HTTPException(
+            status_code=400, 
+            detail="Buy amount must be between $5 and $100,000"
+        )
+    
+    user_state = users[username].state
+    user_state.buy_amount_usd = request.buy_amount_usd
+    
+    db = SessionLocal()
+    try:
+        user_db = db.query(UserDB).filter(UserDB.username == username).first()
+        if not user_db:
+            raise HTTPException(status_code=404, detail="User not found in database")
+        
+        user_db.buy_amount_usd = request.buy_amount_usd
+        db.commit()
+        db.refresh(user_db)
+        
+        persisted_value = float(user_db.buy_amount_usd)
+        logger.info(f"User {username}: Buy amount updated to ${persisted_value:.2f} (persisted to DB)")
+        
+        return {
+            "success": True,
+            "buy_amount_usd": persisted_value
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to update buy amount for {username}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update buy amount: {str(e)}")
+    finally:
+        db.close()
+
 @app.post("/webhook")
 async def webhook(alert: WebhookAlert):
     """
@@ -1972,6 +2070,8 @@ async def get_status(username: str = Depends(verify_session)):
             "emergency_stop": user_state.emergency_stop if user_state.emergency_stop is not None else False,
             "stop_loss_enabled": user_state.stop_loss_enabled if user_state.stop_loss_enabled is not None else True,
             "stop_loss_pct": float(user_state.stop_loss_pct) if user_state.stop_loss_pct is not None else 0.02,
+            "position_size_pct": float(user_state.position_size_pct) if user_state.position_size_pct is not None else 0.02,
+            "buy_amount_usd": float(user_state.buy_amount_usd) if user_state.buy_amount_usd is not None else 0.0,
             "coin_trading_enabled": user_state.coin_trading_enabled if user_state.coin_trading_enabled else {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
             "last_webhook": user_state.last_webhook,
             "last_order": user_state.last_order,
@@ -1995,6 +2095,8 @@ async def get_status(username: str = Depends(verify_session)):
             "emergency_stop": False,
             "stop_loss_enabled": True,
             "stop_loss_pct": 0.02,
+            "position_size_pct": 0.02,
+            "buy_amount_usd": 0.0,
             "coin_trading_enabled": {"BTC": True, "ETH": True, "SOL": True, "XRP": True},
             "last_webhook": None,
             "last_order": None,
