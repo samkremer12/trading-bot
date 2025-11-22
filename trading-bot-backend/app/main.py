@@ -1001,7 +1001,9 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 user_state.auto_trading_enabled = bool(user_db.auto_trading_enabled)
                 user_state.stop_loss_enabled = bool(user_db.stop_loss_enabled)
                 user_state.emergency_stop = bool(user_db.emergency_stop)
-                logger.info(f"Webhook for {username}: Refreshed gate flags from DB - auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}")
+                user_state.buy_amount_usd = float(user_db.buy_amount_usd or 0)
+                user_state.position_size_pct = float(user_db.position_size_pct or user_state.position_size_pct)
+                logger.info(f"Webhook for {username}: Refreshed from DB - auto_trading={user_state.auto_trading_enabled}, stop_loss={user_state.stop_loss_enabled}, emergency_stop={user_state.emergency_stop}, buy_amount_usd=${user_state.buy_amount_usd:.2f}")
         finally:
             db.close()
         
@@ -1056,7 +1058,7 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 else:
                     normalized_amount = float(alert.amount)
             
-            amount = 0.001  # default
+            amount = None
             
             if user_state.exchange_type == "kraken" and user_state.kraken_client:
                 try:
@@ -1089,78 +1091,65 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 logger.info(f"Symbol conversion: alert.symbol={alert.symbol} -> normalized={symbol} -> kraken_pair={kraken_pair}")
                 logger.info(f"Kraken balance keys: {list(balance_data.keys())}, coin={coin}")
                 
-                if alert.sell_all or normalized_amount == "all":
-                    coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
-                    coin_balance = float(balance_data.get(coin_key, 0))
-                    logger.info(f"Sell all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                elif normalized_usd_amount:
-                    if side == "buy":
-                        if alert.price:
-                            price_used = float(alert.price)
-                        else:
-                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, normalized_usd_amount, price_used, balance_data)
+                if side == "buy":
+                    if user_state.buy_amount_usd <= 0:
+                        result["status"] = "skipped"
+                        result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
+                        return result
+                    
+                    pair_info = await user_state.kraken_client.get_asset_pairs(kraken_pair)
+                    quote_currency = pair_info.get('quote', 'UNKNOWN')
+                    quote_balance_key = user_state.kraken_client.to_kraken_balance_key(quote_currency)
+                    quote_balance = float(balance_data.get(quote_balance_key, 0))
+                    
+                    usd_to_spend = min(user_state.buy_amount_usd, quote_balance)
+                    
+                    if usd_to_spend < 10:
+                        result["status"] = "skipped"
+                        result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${quote_balance:.2f}, minimum $10"
+                        return result
+                    
+                    if alert.price:
+                        price_used = float(alert.price)
                     else:
-                        if alert.price:
-                            price_used = float(alert.price)
-                            raw_amount = normalized_usd_amount / price_used
-                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
-                        else:
-                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = normalized_usd_amount / current_price
-                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                elif normalized_amount and normalized_amount != "all":
-                    raw_amount = float(normalized_amount)
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                    coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
-                    coin_balance = float(balance_data.get(coin_key, 0))
-                    logger.info(f"Quantity all: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
-                elif normalized_usd_amount:
-                    if side == "buy":
-                        if alert.price:
-                            price_used = float(alert.price)
-                        else:
-                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, normalized_usd_amount, price_used, balance_data)
-                    else:
-                        if alert.price:
-                            price_used = float(alert.price)
-                            raw_amount = normalized_usd_amount / price_used
-                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
-                        else:
-                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = normalized_usd_amount / current_price
-                            logger.info(f"USD conversion (sell): ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                elif alert.quantity:
-                    raw_amount = float(alert.quantity)
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
-                elif usdt_balance > 0:
-                    if user_state.buy_amount_usd > 0:
-                        position_size_usdt = user_state.buy_amount_usd
-                        logger.info(f"Using fixed buy amount: ${position_size_usdt:.2f}")
-                    else:
-                        position_size_usdt = calculate_position_size(usdt_balance, user_state.position_size_pct)
-                        logger.info(f"Using percentage-based sizing: {user_state.position_size_pct * 100:.1f}% of ${usdt_balance:.2f} = ${position_size_usdt:.2f}")
-                    if side == "buy":
-                        if alert.price:
-                            price_used = float(alert.price)
-                        else:
-                            price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                        amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, position_size_usdt, price_used, balance_data)
-                    else:
-                        if alert.price:
-                            raw_amount = position_size_usdt / float(alert.price)
-                        else:
-                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
-                            raw_amount = position_size_usdt / current_price
-                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                        price_used = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                    
+                    logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
+                    amount = await calculate_fee_aware_buy_volume(user_state.kraken_client, kraken_pair, usd_to_spend, price_used, balance_data)
+                
                 else:
-                    amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, 0.001, side)
+                    if alert.sell_all or normalized_amount == "all":
+                        coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
+                        coin_balance = float(balance_data.get(coin_key, 0))
+                        logger.info(f"SELL ALL: coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
+                    elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                        coin_key = user_state.kraken_client.to_kraken_balance_key(coin)
+                        coin_balance = float(balance_data.get(coin_key, 0))
+                        logger.info(f"SELL ALL (quantity): coin={coin}, coin_key={coin_key}, balance={coin_balance:.8f}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, coin_balance, side)
+                    elif normalized_usd_amount:
+                        if alert.price:
+                            price_used = float(alert.price)
+                            raw_amount = normalized_usd_amount / price_used
+                            logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {raw_amount:.8f} {coin}")
+                        else:
+                            current_price = await user_state.kraken_client.get_ticker_price(kraken_pair)
+                            raw_amount = normalized_usd_amount / current_price
+                            logger.info(f"SELL USD: ${normalized_usd_amount} / ${current_price} (live) = {raw_amount:.8f} {coin}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                    elif normalized_amount and normalized_amount != "all":
+                        raw_amount = float(normalized_amount)
+                        logger.info(f"SELL AMOUNT: {raw_amount:.8f} {coin}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                    elif alert.quantity:
+                        raw_amount = float(alert.quantity)
+                        logger.info(f"SELL QUANTITY: {raw_amount:.8f} {coin}")
+                        amount = await round_and_enforce_kraken_volume(user_state.kraken_client, kraken_pair, alert.symbol, raw_amount, side)
+                    else:
+                        result["status"] = "skipped"
+                        result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
+                        return result
                 
                 if amount == 0:
                     logger.warning(f"Skipping order: volume is 0 (likely dust balance below ordermin)")
@@ -1239,43 +1228,55 @@ async def execute_webhook_for_user(username: str, user_state: UserState, alert: 
                 balance = user_state.exchange.fetch_balance()
                 usdt_balance = balance.get('USDT', {}).get('free', 0)
                 
-                if alert.sell_all:
-                    coin_balance = balance.get(coin, {}).get('free', 0)
-                    amount = coin_balance
-                elif normalized_usd_amount:
+                if side == "buy":
+                    if user_state.buy_amount_usd <= 0:
+                        result["status"] = "skipped"
+                        result["error"] = f"Buy amount not configured (currently ${user_state.buy_amount_usd:.2f}). Please set a buy amount using the slider."
+                        return result
+                    
+                    usd_to_spend = min(user_state.buy_amount_usd, usdt_balance)
+                    
+                    if usd_to_spend < 10:
+                        result["status"] = "skipped"
+                        result["error"] = f"Insufficient funds: configured buy amount ${user_state.buy_amount_usd:.2f}, available ${usdt_balance:.2f}, minimum $10"
+                        return result
+                    
                     if alert.price:
-                        amount = normalized_usd_amount / float(alert.price)
+                        price_used = float(alert.price)
                     else:
                         ticker = user_state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = normalized_usd_amount / current_price
-                elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
-                    coin_balance = balance.get(coin, {}).get('free', 0)
-                    amount = coin_balance
-                elif normalized_usd_amount:
-                    if alert.price:
-                        amount = normalized_usd_amount / float(alert.price)
-                    else:
-                        ticker = user_state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = normalized_usd_amount / current_price
-                elif alert.quantity:
-                    amount = float(alert.quantity)
-                elif usdt_balance > 0:
-                    if user_state.buy_amount_usd > 0:
-                        position_size_usdt = user_state.buy_amount_usd
-                        logger.info(f"Using fixed buy amount: ${position_size_usdt:.2f}")
-                    else:
-                        position_size_usdt = calculate_position_size(usdt_balance, user_state.position_size_pct)
-                        logger.info(f"Using percentage-based sizing: {user_state.position_size_pct * 100:.1f}% of ${usdt_balance:.2f} = ${position_size_usdt:.2f}")
-                    if alert.price:
-                        amount = position_size_usdt / float(alert.price)
-                    else:
-                        ticker = user_state.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        amount = position_size_usdt / current_price
+                        price_used = ticker['last']
+                    
+                    logger.info(f"BUY ORDER: Using slider buy_amount_usd=${user_state.buy_amount_usd:.2f}, clamped to available ${usd_to_spend:.2f}, price=${price_used:.2f}")
+                    amount = usd_to_spend / price_used
+                
                 else:
-                    amount = 0.001
+                    if alert.sell_all:
+                        coin_balance = balance.get(coin, {}).get('free', 0)
+                        logger.info(f"SELL ALL: coin={coin}, balance={coin_balance:.8f}")
+                        amount = coin_balance
+                    elif alert.quantity == "all" or (isinstance(alert.quantity, str) and alert.quantity.lower() == "all"):
+                        coin_balance = balance.get(coin, {}).get('free', 0)
+                        logger.info(f"SELL ALL (quantity): coin={coin}, balance={coin_balance:.8f}")
+                        amount = coin_balance
+                    elif normalized_usd_amount:
+                        if alert.price:
+                            price_used = float(alert.price)
+                        else:
+                            ticker = user_state.exchange.fetch_ticker(symbol)
+                            price_used = ticker['last']
+                        amount = normalized_usd_amount / price_used
+                        logger.info(f"SELL USD: ${normalized_usd_amount} / ${price_used} = {amount:.8f} {coin}")
+                    elif normalized_amount and normalized_amount != "all":
+                        amount = float(normalized_amount)
+                        logger.info(f"SELL AMOUNT: {amount:.8f} {coin}")
+                    elif alert.quantity:
+                        amount = float(alert.quantity)
+                        logger.info(f"SELL QUANTITY: {amount:.8f} {coin}")
+                    else:
+                        result["status"] = "skipped"
+                        result["error"] = "No sell amount provided in webhook (use quantity, usd, or sell_all)"
+                        return result
                 
                 order = None
                 max_retries = 3
